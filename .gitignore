@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.idea/
+/.vscode/
+*.pdb
+*.log
+portfolio.json
+settings.json
