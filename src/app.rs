@@ -55,29 +55,37 @@ impl StockWatchApp {
             show_toolbar: false,
         };
         if app.settings.ultra_compact {
-            cc.egui_ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(
-                COMPACT_WINDOW_SIZE[0],
-                COMPACT_WINDOW_SIZE[1],
-            )));
+            cc.egui_ctx
+                .send_viewport_cmd(ViewportCommand::InnerSize(vec2(
+                    COMPACT_WINDOW_SIZE[0],
+                    COMPACT_WINDOW_SIZE[1],
+                )));
         }
-        app.start_fetch();
+        app.start_fetch(true);
         app
     }
 
-    fn start_fetch(&mut self) {
+    fn start_fetch(&mut self, force_once: bool) {
         if self.fetch_rx.is_some() {
             return;
         }
-        if let Some(delay) = delay_until_next_market_session(Local::now()) {
-            self.quotes.loading = false;
-            self.next_refresh_at = Instant::now() + delay;
-            self.status = format!("非交易时段，{} 后刷新", format_duration_for_status(delay));
-            return;
+        let off_session_delay = delay_until_next_market_session(Local::now());
+        if !force_once {
+            if let Some(delay) = off_session_delay {
+                self.quotes.loading = false;
+                self.next_refresh_at = Instant::now() + delay;
+                self.status = format!("非交易时段，{} 后刷新", format_duration_for_status(delay));
+                return;
+            }
         }
         self.portfolio.normalize();
         self.quotes.loading = true;
         self.fetch_rx = Some(quote::spawn_fetch(self.portfolio.holdings.clone()));
-        self.status = "正在刷新东方财富行情...".to_owned();
+        self.status = if off_session_delay.is_some() {
+            "正在拉取非交易时段行情...".to_owned()
+        } else {
+            "正在刷新行情...".to_owned()
+        };
     }
 
     fn poll_fetch(&mut self) {
@@ -102,17 +110,30 @@ impl StockWatchApp {
                 self.quotes.loading = false;
                 self.fetch_rx = None;
                 self.quote_failure_count = 0;
-                self.next_refresh_at = Instant::now() + self.normal_refresh_delay();
-                self.status = format!("行情已更新（{}）", result.source.label());
+                if let Some(delay) = delay_until_next_market_session(Local::now()) {
+                    self.next_refresh_at = Instant::now() + delay;
+                    self.status = format!(
+                        "行情已更新（{}，非交易时段）；{} 后刷新",
+                        result.source.label(),
+                        format_duration_for_status(delay)
+                    );
+                } else {
+                    self.next_refresh_at = Instant::now() + self.normal_refresh_delay();
+                    self.status = format!("行情已更新（{}）", result.source.label());
+                }
             }
             Ok(Err(err)) => {
                 self.quotes.last_error = Some(err.to_string());
                 self.quotes.loading = false;
                 self.fetch_rx = None;
                 self.quote_failure_count = self.quote_failure_count.saturating_add(1);
-                let delay = self.failure_refresh_delay();
+                let delay = delay_until_next_market_session(Local::now())
+                    .unwrap_or_else(|| self.failure_refresh_delay());
                 self.next_refresh_at = Instant::now() + delay;
-                self.status = format!("行情刷新失败：{err:#}；{}s 后重试", delay.as_secs());
+                self.status = format!(
+                    "行情刷新失败：{err:#}；{} 后重试",
+                    format_duration_for_status(delay)
+                );
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -298,8 +319,7 @@ impl StockWatchApp {
     fn set_ultra_compact(&mut self, ctx: &egui::Context, compact: bool) {
         if compact {
             if let Some(size) = ctx.input(|i| i.viewport().inner_rect.map(|rect| rect.size())) {
-                if size.x > COMPACT_WINDOW_SIZE[0] + 24.0
-                    || size.y > COMPACT_WINDOW_SIZE[1] + 24.0
+                if size.x > COMPACT_WINDOW_SIZE[0] + 24.0 || size.y > COMPACT_WINDOW_SIZE[1] + 24.0
                 {
                     self.settings.normal_window_size = Some([size.x, size.y]);
                 }
@@ -311,7 +331,10 @@ impl StockWatchApp {
             )));
         } else {
             self.settings.ultra_compact = false;
-            let size = self.settings.normal_window_size.unwrap_or(NORMAL_WINDOW_SIZE);
+            let size = self
+                .settings
+                .normal_window_size
+                .unwrap_or(NORMAL_WINDOW_SIZE);
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(size[0], size[1])));
         }
         let _ = config::save_settings(&self.settings);
@@ -323,7 +346,7 @@ impl eframe::App for StockWatchApp {
         self.poll_fetch();
         self.poll_ai_ocr();
         if Instant::now() >= self.next_refresh_at && !self.editing {
-            self.start_fetch();
+            self.start_fetch(false);
         }
         ctx.send_viewport_cmd(ViewportCommand::WindowLevel(
             if self.settings.always_on_top {
@@ -487,7 +510,7 @@ impl StockWatchApp {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if ui.small_button("刷新").clicked() {
-                        self.start_fetch();
+                        self.start_fetch(true);
                     }
                     if ui.small_button("添加").clicked() {
                         self.add_empty_holding();
@@ -1098,6 +1121,10 @@ fn market_time(hour: u32, minute: u32) -> NaiveTime {
 }
 
 fn format_duration_for_status(duration: Duration) -> String {
+    if duration.as_secs() < 60 {
+        return format!("{}秒", duration.as_secs());
+    }
+
     let total_minutes = (duration.as_secs() + 59) / 60;
     if total_minutes < 60 {
         format!("{total_minutes}分钟")
