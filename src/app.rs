@@ -21,6 +21,13 @@ use std::{
 const NORMAL_WINDOW_SIZE: [f32; 2] = [720.0, 420.0];
 const COMPACT_WINDOW_SIZE: [f32; 2] = [252.0, 112.0];
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PortfolioTotals {
+    total_assets: f64,
+    position_pnl: f64,
+    today_pnl: f64,
+}
+
 pub struct StockWatchApp {
     portfolio: Portfolio,
     settings: AppSettings,
@@ -80,7 +87,7 @@ impl StockWatchApp {
         }
         self.portfolio.normalize();
         self.quotes.loading = true;
-        self.fetch_rx = Some(quote::spawn_fetch(self.portfolio.holdings.clone()));
+        self.fetch_rx = Some(quote::spawn_fetch(self.portfolio.holdings_vec()));
         self.status = if off_session_delay.is_some() {
             "正在拉取非交易时段行情...".to_owned()
         } else {
@@ -169,7 +176,8 @@ impl StockWatchApp {
             }
             Ok(Ok(mut holdings)) => {
                 self.ai_ocr_rx = None;
-                self.portfolio.holdings.append(&mut holdings);
+                self.portfolio
+                    .append_holdings_to_first_account(&mut holdings);
                 self.portfolio.normalize();
                 self.editing = true;
                 match config::save_portfolio(&mut self.portfolio) {
@@ -199,7 +207,7 @@ impl StockWatchApp {
     }
 
     fn add_empty_holding(&mut self) {
-        self.portfolio.holdings.push(Holding {
+        self.portfolio.push_holding_to_first_account(Holding {
             code: String::new(),
             name: String::new(),
             quantity: 0.0,
@@ -226,7 +234,8 @@ impl StockWatchApp {
                 self.status = "没有从截图中识别出可用持仓行".to_owned();
             }
             Ok(mut holdings) => {
-                self.portfolio.holdings.append(&mut holdings);
+                self.portfolio
+                    .append_holdings_to_first_account(&mut holdings);
                 self.portfolio.normalize();
                 self.editing = true;
                 match config::save_portfolio(&mut self.portfolio) {
@@ -295,11 +304,9 @@ impl StockWatchApp {
         self.ai_ocr_rx = Some(rx);
     }
 
-    fn totals(&self) -> (f64, f64, f64) {
-        self.portfolio
-            .holdings
-            .iter()
-            .fold((0.0, 0.0, 0.0), |acc, h| {
+    fn totals(&self) -> PortfolioTotals {
+        let (market_value, position_pnl, today_pnl) =
+            self.portfolio.holdings().fold((0.0, 0.0, 0.0), |acc, h| {
                 if let Some(q) = self.quotes.quotes.get(&h.code) {
                     (
                         acc.0 + q.market_value(h),
@@ -309,7 +316,13 @@ impl StockWatchApp {
                 } else {
                     acc
                 }
-            })
+            });
+        let cash = self.portfolio.cash();
+        PortfolioTotals {
+            total_assets: market_value + cash,
+            position_pnl,
+            today_pnl,
+        }
     }
 
     fn pnl_color(&self, value: f64) -> Color32 {
@@ -423,7 +436,7 @@ impl StockWatchApp {
     }
 
     fn render_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (value, total_pnl, today_pnl) = self.totals();
+        let totals = self.totals();
         Frame::new()
             .fill(Color32::from_rgb(19, 23, 30))
             .stroke(Stroke::new(1.0, Color32::from_rgb(36, 43, 54)))
@@ -439,8 +452,8 @@ impl StockWatchApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format_money(today_pnl))
-                                .color(self.pnl_color(today_pnl))
+                            RichText::new(format_money(totals.today_pnl))
+                                .color(self.pnl_color(totals.today_pnl))
                                 .strong(),
                         );
                         ui.label(RichText::new("今日").color(Color32::from_gray(132)));
@@ -454,23 +467,23 @@ impl StockWatchApp {
                 ui.horizontal_wrapped(|ui| {
                     metric_card(
                         ui,
-                        "市值",
-                        value,
+                        "总资产",
+                        totals.total_assets,
                         Color32::from_gray(235),
                         self.settings.font_scale,
                     );
                     metric_card(
                         ui,
                         "持仓盈亏",
-                        total_pnl,
-                        self.pnl_color(total_pnl),
+                        totals.position_pnl,
+                        self.pnl_color(totals.position_pnl),
                         self.settings.font_scale,
                     );
                     metric_card(
                         ui,
-                        "今日浮盈",
-                        today_pnl,
-                        self.pnl_color(today_pnl),
+                        "今日持仓",
+                        totals.today_pnl,
+                        self.pnl_color(totals.today_pnl),
                         self.settings.font_scale,
                     );
                 });
@@ -478,7 +491,7 @@ impl StockWatchApp {
     }
 
     fn render_ultra_compact(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let (_, _, today_pnl) = self.totals();
+        let totals = self.totals();
         Frame::new()
             .fill(Color32::from_rgb(19, 23, 30))
             .stroke(Stroke::new(1.0, Color32::from_rgb(36, 43, 54)))
@@ -489,13 +502,13 @@ impl StockWatchApp {
                     if compact_toggle_button(ui, self.settings.ultra_compact).clicked() {
                         self.set_ultra_compact(ctx, false);
                     }
-                    ui.label(RichText::new("今日浮盈").color(Color32::from_gray(150)));
+                    ui.label(RichText::new("今日持仓").color(Color32::from_gray(150)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format_money(today_pnl))
+                            RichText::new(format_money(totals.today_pnl))
                                 .size(18.0 * self.settings.font_scale)
                                 .strong()
-                                .color(self.pnl_color(today_pnl)),
+                                .color(self.pnl_color(totals.today_pnl)),
                         );
                     });
                 });
@@ -777,72 +790,89 @@ impl StockWatchApp {
                         ui.end_row();
 
                         let mut remove_idx = None;
-                        for (idx, holding) in self.portfolio.holdings.iter_mut().enumerate() {
-                            let quote = self.quotes.quotes.get(&holding.code).cloned();
+                        for (account_idx, account) in self.portfolio.accounts.iter_mut().enumerate()
+                        {
                             if self.editing {
                                 ui.add_sized(
                                     [84.0, row_height],
-                                    egui::TextEdit::singleline(&mut holding.name),
+                                    egui::TextEdit::singleline(&mut account.name),
                                 );
-                            } else {
-                                let display_name = quote
-                                    .as_ref()
-                                    .map(|q| q.name.as_str())
-                                    .filter(|name| !name.trim().is_empty())
-                                    .unwrap_or(&holding.name);
-                                ui.label(RichText::new(display_name).color(Color32::WHITE));
-                            }
-
-                            if let Some(q) = quote {
-                                ui.label(format!("{:.3}", q.price));
-                                ui.label(
-                                    RichText::new(format!("{:+.2}%", q.change_percent))
-                                        .color(pnl_color_for(q.change_percent)),
-                                );
-                                ui.label(
-                                    RichText::new(format_money(q.position_pnl(holding)))
-                                        .color(pnl_color_for(q.position_pnl(holding))),
-                                );
-                                ui.label(
-                                    RichText::new(format_money(q.today_pnl(holding)))
-                                        .color(pnl_color_for(q.today_pnl(holding))),
-                                );
-                                ui.label(
-                                    RichText::new(format_money(q.market_value(holding)))
-                                        .color(Color32::from_gray(170)),
-                                );
-                            } else {
-                                for _ in 0..5 {
-                                    ui.label(RichText::new("--").color(Color32::from_gray(110)));
+                                for _ in 0..6 {
+                                    ui.label("");
                                 }
+                                ui.end_row();
                             }
 
-                            if self.editing {
-                                let code_response = ui.add_sized(
-                                    [72.0, row_height],
-                                    egui::TextEdit::singleline(&mut holding.code),
-                                );
-                                if code_response.changed() {
-                                    holding.code = holding
-                                        .code
-                                        .chars()
-                                        .filter(|c| c.is_ascii_digit())
-                                        .take(6)
-                                        .collect();
-                                    if holding.code.len() == 6 {
-                                        holding.market = Market::infer(&holding.code);
+                            for (holding_idx, holding) in account.holdings.iter_mut().enumerate() {
+                                let quote = self.quotes.quotes.get(&holding.code).cloned();
+                                if self.editing {
+                                    ui.add_sized(
+                                        [84.0, row_height],
+                                        egui::TextEdit::singleline(&mut holding.name),
+                                    );
+                                } else {
+                                    let display_name = quote
+                                        .as_ref()
+                                        .map(|q| q.name.as_str())
+                                        .filter(|name| !name.trim().is_empty())
+                                        .unwrap_or(&holding.name);
+                                    ui.label(RichText::new(display_name).color(Color32::WHITE));
+                                }
+
+                                if let Some(q) = quote {
+                                    ui.label(format!("{:.3}", q.price));
+                                    ui.label(
+                                        RichText::new(format!("{:+.2}%", q.change_percent))
+                                            .color(pnl_color_for(q.change_percent)),
+                                    );
+                                    ui.label(
+                                        RichText::new(format_money(q.position_pnl(holding)))
+                                            .color(pnl_color_for(q.position_pnl(holding))),
+                                    );
+                                    ui.label(
+                                        RichText::new(format_money(q.today_pnl(holding)))
+                                            .color(pnl_color_for(q.today_pnl(holding))),
+                                    );
+                                    ui.label(
+                                        RichText::new(format_money(q.market_value(holding)))
+                                            .color(Color32::from_gray(170)),
+                                    );
+                                } else {
+                                    for _ in 0..5 {
+                                        ui.label(
+                                            RichText::new("--").color(Color32::from_gray(110)),
+                                        );
                                     }
                                 }
-                                ui.add_sized(
-                                    [86.0, row_height],
-                                    egui::DragValue::new(&mut holding.quantity).speed(100.0),
-                                );
-                                ui.add_sized(
-                                    [76.0, row_height],
-                                    egui::DragValue::new(&mut holding.cost_price).speed(0.1),
-                                );
-                                ui.label(format_money(holding.cost_price * holding.quantity));
-                                egui::ComboBox::from_id_salt(format!("market_{}", idx))
+
+                                if self.editing {
+                                    let code_response = ui.add_sized(
+                                        [72.0, row_height],
+                                        egui::TextEdit::singleline(&mut holding.code),
+                                    );
+                                    if code_response.changed() {
+                                        holding.code = holding
+                                            .code
+                                            .chars()
+                                            .filter(|c| c.is_ascii_digit())
+                                            .take(6)
+                                            .collect();
+                                        if holding.code.len() == 6 {
+                                            holding.market = Market::infer(&holding.code);
+                                        }
+                                    }
+                                    ui.add_sized(
+                                        [86.0, row_height],
+                                        egui::DragValue::new(&mut holding.quantity).speed(100.0),
+                                    );
+                                    ui.add_sized(
+                                        [76.0, row_height],
+                                        egui::DragValue::new(&mut holding.cost_price).speed(0.1),
+                                    );
+                                    ui.label(format_money(holding.cost_price * holding.quantity));
+                                    egui::ComboBox::from_id_salt(format!(
+                                        "market_{account_idx}_{holding_idx}"
+                                    ))
                                     .selected_text(holding.market.label())
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
@@ -861,15 +891,18 @@ impl StockWatchApp {
                                             "北",
                                         );
                                     });
-                                if ui.button("删除").clicked() {
-                                    remove_idx = Some(idx);
+                                    if ui.button("删除").clicked() {
+                                        remove_idx = Some((account_idx, holding_idx));
+                                    }
                                 }
+                                ui.end_row();
                             }
-                            ui.end_row();
                         }
 
-                        if let Some(idx) = remove_idx {
-                            self.portfolio.holdings.remove(idx);
+                        if let Some((account_idx, holding_idx)) = remove_idx {
+                            if let Some(account) = self.portfolio.accounts.get_mut(account_idx) {
+                                account.holdings.remove(holding_idx);
+                            }
                         }
                     });
             });

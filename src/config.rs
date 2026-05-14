@@ -1,4 +1,4 @@
-use crate::portfolio::Portfolio;
+use crate::portfolio::{Holding, Portfolio};
 use anyhow::Context;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -89,7 +89,7 @@ pub fn load_portfolio() -> Portfolio {
         return Portfolio::default();
     };
 
-    serde_json::from_str(&raw).unwrap_or_else(|_| Portfolio::default())
+    load_portfolio_from_str(&raw).unwrap_or_else(|_| Portfolio::default())
 }
 
 pub fn save_portfolio(portfolio: &mut Portfolio) -> anyhow::Result<()> {
@@ -119,4 +119,28 @@ pub fn save_settings(settings: &AppSettings) -> anyhow::Result<()> {
         serde_json::to_string_pretty(settings).context("serialize settings")?,
     )
     .context("write settings")
+}
+
+fn load_portfolio_from_str(raw: &str) -> anyhow::Result<Portfolio> {
+    let value: serde_json::Value = serde_json::from_str(raw).context("parse portfolio json")?;
+    if value.get("accounts").is_some() {
+        let mut portfolio: Portfolio =
+            serde_json::from_value(value).context("parse account portfolio")?;
+        portfolio.normalize();
+        return Ok(portfolio);
+    }
+
+    let legacy: LegacyPortfolio =
+        serde_json::from_value(value).context("parse legacy portfolio")?;
+    Ok(Portfolio::from_legacy_holdings(
+        legacy.holdings,
+        legacy.last_saved_at,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyPortfolio {
+    holdings: Vec<Holding>,
+    #[serde(default)]
+    last_saved_at: Option<chrono::DateTime<Local>>,
 }

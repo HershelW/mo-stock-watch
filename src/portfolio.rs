@@ -53,54 +53,148 @@ fn default_market() -> Market {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Portfolio {
-    pub holdings: Vec<Holding>,
+    pub accounts: Vec<Account>,
     #[serde(default)]
     pub last_saved_at: Option<DateTime<Local>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub cash: f64,
+    pub holdings: Vec<Holding>,
 }
 
 impl Default for Portfolio {
     fn default() -> Self {
         Self {
-            holdings: vec![
-                Holding {
-                    code: "600519".to_owned(),
-                    name: "贵州茅台".to_owned(),
-                    quantity: 100.0,
-                    cost_price: 1500.0,
-                    market: Market::Shanghai,
-                },
-                Holding {
-                    code: "000001".to_owned(),
-                    name: "平安银行".to_owned(),
-                    quantity: 1000.0,
-                    cost_price: 10.0,
-                    market: Market::Shenzhen,
-                },
-            ],
+            accounts: vec![Account {
+                id: "default".to_owned(),
+                name: "默认账户".to_owned(),
+                cash: 0.0,
+                holdings: vec![
+                    Holding {
+                        code: "600519".to_owned(),
+                        name: "贵州茅台".to_owned(),
+                        quantity: 100.0,
+                        cost_price: 1500.0,
+                        market: Market::Shanghai,
+                    },
+                    Holding {
+                        code: "000001".to_owned(),
+                        name: "平安银行".to_owned(),
+                        quantity: 1000.0,
+                        cost_price: 10.0,
+                        market: Market::Shenzhen,
+                    },
+                ],
+            }],
             last_saved_at: None,
         }
     }
 }
 
 impl Portfolio {
+    pub fn from_legacy_holdings(
+        holdings: Vec<Holding>,
+        last_saved_at: Option<DateTime<Local>>,
+    ) -> Self {
+        let mut portfolio = Self {
+            accounts: vec![Account {
+                id: "default".to_owned(),
+                name: "默认账户".to_owned(),
+                cash: 0.0,
+                holdings,
+            }],
+            last_saved_at,
+        };
+        portfolio.normalize();
+        portfolio
+    }
+
+    pub fn holdings(&self) -> impl Iterator<Item = &Holding> {
+        self.accounts
+            .iter()
+            .flat_map(|account| account.holdings.iter())
+    }
+
+    pub fn holdings_vec(&self) -> Vec<Holding> {
+        self.holdings().cloned().collect()
+    }
+
+    pub fn cash(&self) -> f64 {
+        self.accounts
+            .iter()
+            .map(|account| account.cash)
+            .filter(|cash| cash.is_finite())
+            .sum()
+    }
+
+    pub fn push_holding_to_first_account(&mut self, holding: Holding) {
+        self.ensure_account();
+        self.accounts[0].holdings.push(holding);
+    }
+
+    pub fn append_holdings_to_first_account(&mut self, holdings: &mut Vec<Holding>) {
+        self.ensure_account();
+        self.accounts[0].holdings.append(holdings);
+    }
+
     pub fn normalize(&mut self) {
-        for holding in &mut self.holdings {
-            holding.code = holding
-                .code
-                .chars()
-                .filter(|c| c.is_ascii_digit())
-                .take(6)
-                .collect();
-            if holding.code.len() == 6 {
-                holding.market = Market::infer(&holding.code);
+        self.ensure_account();
+        for (idx, account) in self.accounts.iter_mut().enumerate() {
+            account.id = sanitize_account_id(&account.id, idx);
+            account.name = account.name.trim().to_owned();
+            if account.name.is_empty() {
+                account.name = format!("账户{}", idx + 1);
             }
-            holding.name = holding.name.trim().to_owned();
+            if !account.cash.is_finite() {
+                account.cash = 0.0;
+            }
+
+            for holding in &mut account.holdings {
+                holding.code = holding
+                    .code
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .take(6)
+                    .collect();
+                if holding.code.len() == 6 {
+                    holding.market = Market::infer(&holding.code);
+                }
+                holding.name = holding.name.trim().to_owned();
+            }
+            account.holdings.retain(|h| {
+                h.code.len() == 6
+                    && h.quantity.is_finite()
+                    && h.quantity > 0.0
+                    && h.cost_price.is_finite()
+            });
         }
-        self.holdings.retain(|h| {
-            h.code.len() == 6
-                && h.quantity.is_finite()
-                && h.quantity > 0.0
-                && h.cost_price.is_finite()
-        });
+    }
+
+    fn ensure_account(&mut self) {
+        if self.accounts.is_empty() {
+            self.accounts.push(Account {
+                id: "default".to_owned(),
+                name: "默认账户".to_owned(),
+                cash: 0.0,
+                holdings: Vec::new(),
+            });
+        }
+    }
+}
+
+fn sanitize_account_id(id: &str, idx: usize) -> String {
+    let clean = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>();
+    if clean.is_empty() {
+        format!("account-{}", idx + 1)
+    } else {
+        clean
     }
 }
