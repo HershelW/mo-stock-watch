@@ -133,6 +133,8 @@ pub fn recognize_holdings_with_openai(
                     .get("quantity")
                     .and_then(Value::as_f64)
                     .unwrap_or_default(),
+                available_quantity: None,
+                available_date: None,
                 cost_price: row
                     .get("cost_price")
                     .and_then(Value::as_f64)

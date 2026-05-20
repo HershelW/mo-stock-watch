@@ -87,6 +87,8 @@ pub fn parse_holdings_from_ocr_text(text: &str) -> Vec<Holding> {
             code: code.clone(),
             name: if name.is_empty() { code.clone() } else { name },
             quantity,
+            available_quantity: None,
+            available_date: None,
             cost_price,
             market: Market::infer(&code),
         });

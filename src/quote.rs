@@ -56,7 +56,12 @@ impl Quote {
     }
 
     pub fn today_pnl(&self, holding: &Holding) -> f64 {
-        (self.price - self.previous_close) * holding.quantity
+        let quote_date = self.updated_at.date_naive();
+        let overnight_quantity = holding.overnight_quantity_for(quote_date);
+        let intraday_quantity = holding.intraday_quantity_for(quote_date);
+
+        (self.price - self.previous_close) * overnight_quantity
+            + (self.price - holding.cost_price) * intraday_quantity
     }
 
     pub fn market_value(&self, holding: &Holding) -> f64 {
@@ -345,5 +350,58 @@ mod tests {
         assert_eq!(quote.price, 1501.00);
         assert_eq!(quote.previous_close, 1500.00);
         assert!((quote.change_percent - 0.0667).abs() < 0.001);
+    }
+
+    #[test]
+    fn today_pnl_uses_cost_for_same_day_unavailable_shares() {
+        let now = Local.with_ymd_and_hms(2026, 5, 20, 11, 27, 0).unwrap();
+        let quote = Quote {
+            code: "603986".to_owned(),
+            name: "兆易创新".to_owned(),
+            price: 439.56,
+            previous_close: 410.0,
+            change_percent: 7.21,
+            updated_at: now,
+        };
+        let holding = Holding {
+            code: "603986".to_owned(),
+            name: "兆易创新".to_owned(),
+            quantity: 300.0,
+            available_quantity: Some(0.0),
+            available_date: Some(now.date_naive()),
+            cost_price: 423.538,
+            market: Market::Shanghai,
+        };
+
+        assert!((quote.today_pnl(&holding) - 4806.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn today_pnl_treats_old_available_date_as_overnight() {
+        let now = Local.with_ymd_and_hms(2026, 5, 21, 9, 35, 0).unwrap();
+        let quote = Quote {
+            code: "603986".to_owned(),
+            name: "兆易创新".to_owned(),
+            price: 439.56,
+            previous_close: 430.0,
+            change_percent: 2.22,
+            updated_at: now,
+        };
+        let holding = Holding {
+            code: "603986".to_owned(),
+            name: "兆易创新".to_owned(),
+            quantity: 300.0,
+            available_quantity: Some(0.0),
+            available_date: Some(
+                Local
+                    .with_ymd_and_hms(2026, 5, 20, 11, 27, 0)
+                    .unwrap()
+                    .date_naive(),
+            ),
+            cost_price: 423.538,
+            market: Market::Shanghai,
+        };
+
+        assert!((quote.today_pnl(&holding) - 2868.0).abs() < 0.01);
     }
 }

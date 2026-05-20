@@ -211,6 +211,8 @@ impl StockWatchApp {
             code: String::new(),
             name: String::new(),
             quantity: 0.0,
+            available_quantity: None,
+            available_date: None,
             cost_price: 0.0,
             market: Market::Shenzhen,
         });
@@ -481,7 +483,7 @@ impl StockWatchApp {
                     );
                     metric_card(
                         ui,
-                        "今日持仓",
+                        "今日盈亏",
                         totals.today_pnl,
                         self.pnl_color(totals.today_pnl),
                         self.settings.font_scale,
@@ -502,7 +504,7 @@ impl StockWatchApp {
                     if compact_toggle_button(ui, self.settings.ultra_compact).clicked() {
                         self.set_ultra_compact(ctx, false);
                     }
-                    ui.label(RichText::new("今日持仓").color(Color32::from_gray(150)));
+                    ui.label(RichText::new("今日盈亏").color(Color32::from_gray(150)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format_money(totals.today_pnl))

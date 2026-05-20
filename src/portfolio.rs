@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -6,9 +6,30 @@ pub struct Holding {
     pub code: String,
     pub name: String,
     pub quantity: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_quantity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_date: Option<NaiveDate>,
     pub cost_price: f64,
     #[serde(default = "default_market")]
     pub market: Market,
+}
+
+impl Holding {
+    pub fn overnight_quantity_for(&self, quote_date: NaiveDate) -> f64 {
+        if self.available_date == Some(quote_date) {
+            return self
+                .available_quantity
+                .unwrap_or(self.quantity)
+                .clamp(0.0, self.quantity);
+        }
+
+        self.quantity
+    }
+
+    pub fn intraday_quantity_for(&self, quote_date: NaiveDate) -> f64 {
+        (self.quantity - self.overnight_quantity_for(quote_date)).max(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +100,8 @@ impl Default for Portfolio {
                         code: "600519".to_owned(),
                         name: "贵州茅台".to_owned(),
                         quantity: 100.0,
+                        available_quantity: None,
+                        available_date: None,
                         cost_price: 1500.0,
                         market: Market::Shanghai,
                     },
@@ -86,6 +109,8 @@ impl Default for Portfolio {
                         code: "000001".to_owned(),
                         name: "平安银行".to_owned(),
                         quantity: 1000.0,
+                        available_quantity: None,
+                        available_date: None,
                         cost_price: 10.0,
                         market: Market::Shenzhen,
                     },
@@ -165,6 +190,13 @@ impl Portfolio {
                     holding.market = Market::infer(&holding.code);
                 }
                 holding.name = holding.name.trim().to_owned();
+                holding.available_quantity = holding
+                    .available_quantity
+                    .filter(|quantity| quantity.is_finite())
+                    .map(|quantity| quantity.clamp(0.0, holding.quantity));
+                if holding.available_quantity.is_none() {
+                    holding.available_date = None;
+                }
             }
             account.holdings.retain(|h| {
                 h.code.len() == 6
