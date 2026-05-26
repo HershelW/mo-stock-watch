@@ -135,6 +135,7 @@ pub fn recognize_holdings_with_openai(
                     .unwrap_or_default(),
                 available_quantity: None,
                 available_date: None,
+                intraday_cost_price: None,
                 cost_price: row
                     .get("cost_price")
                     .and_then(Value::as_f64)

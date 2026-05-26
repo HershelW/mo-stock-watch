@@ -89,6 +89,7 @@ pub fn parse_holdings_from_ocr_text(text: &str) -> Vec<Holding> {
             quantity,
             available_quantity: None,
             available_date: None,
+            intraday_cost_price: None,
             cost_price,
             market: Market::infer(&code),
         });

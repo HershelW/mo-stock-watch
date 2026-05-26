@@ -59,9 +59,10 @@ impl Quote {
         let quote_date = self.updated_at.date_naive();
         let overnight_quantity = holding.overnight_quantity_for(quote_date);
         let intraday_quantity = holding.intraday_quantity_for(quote_date);
+        let intraday_cost_price = holding.intraday_cost_price_for(quote_date);
 
         (self.price - self.previous_close) * overnight_quantity
-            + (self.price - holding.cost_price) * intraday_quantity
+            + (self.price - intraday_cost_price) * intraday_quantity
     }
 
     pub fn market_value(&self, holding: &Holding) -> f64 {
@@ -369,6 +370,7 @@ mod tests {
             quantity: 300.0,
             available_quantity: Some(0.0),
             available_date: Some(now.date_naive()),
+            intraday_cost_price: None,
             cost_price: 423.538,
             market: Market::Shanghai,
         };
@@ -398,10 +400,36 @@ mod tests {
                     .unwrap()
                     .date_naive(),
             ),
+            intraday_cost_price: None,
             cost_price: 423.538,
             market: Market::Shanghai,
         };
 
         assert!((quote.today_pnl(&holding) - 2868.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn today_pnl_uses_intraday_cost_for_same_day_buys() {
+        let now = Local.with_ymd_and_hms(2026, 5, 26, 11, 11, 0).unwrap();
+        let quote = Quote {
+            code: "688531".to_owned(),
+            name: "日联科技".to_owned(),
+            price: 160.84,
+            previous_close: 172.98,
+            change_percent: -7.02,
+            updated_at: now,
+        };
+        let holding = Holding {
+            code: "688531".to_owned(),
+            name: "日联科技".to_owned(),
+            quantity: 800.0,
+            available_quantity: Some(599.0),
+            available_date: Some(now.date_naive()),
+            intraday_cost_price: Some(161.54),
+            cost_price: 137.63,
+            market: Market::Shanghai,
+        };
+
+        assert!((quote.today_pnl(&holding) + 7412.56).abs() < 0.01);
     }
 }

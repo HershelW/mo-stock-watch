@@ -10,6 +10,8 @@ pub struct Holding {
     pub available_quantity: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_date: Option<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intraday_cost_price: Option<f64>,
     pub cost_price: f64,
     #[serde(default = "default_market")]
     pub market: Market,
@@ -29,6 +31,17 @@ impl Holding {
 
     pub fn intraday_quantity_for(&self, quote_date: NaiveDate) -> f64 {
         (self.quantity - self.overnight_quantity_for(quote_date)).max(0.0)
+    }
+
+    pub fn intraday_cost_price_for(&self, quote_date: NaiveDate) -> f64 {
+        if self.available_date == Some(quote_date) {
+            return self
+                .intraday_cost_price
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .unwrap_or(self.cost_price);
+        }
+
+        self.cost_price
     }
 }
 
@@ -118,6 +131,7 @@ impl Default for Portfolio {
                         quantity: 100.0,
                         available_quantity: None,
                         available_date: None,
+                        intraday_cost_price: None,
                         cost_price: 1500.0,
                         market: Market::Shanghai,
                     },
@@ -127,6 +141,7 @@ impl Default for Portfolio {
                         quantity: 1000.0,
                         available_quantity: None,
                         available_date: None,
+                        intraday_cost_price: None,
                         cost_price: 10.0,
                         market: Market::Shenzhen,
                     },
@@ -229,6 +244,9 @@ impl Portfolio {
                 if holding.available_quantity.is_none() {
                     holding.available_date = None;
                 }
+                holding.intraday_cost_price = holding
+                    .intraday_cost_price
+                    .filter(|price| price.is_finite() && *price > 0.0);
             }
             account.holdings.retain(|h| {
                 h.code.len() == 6

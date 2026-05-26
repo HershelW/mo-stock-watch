@@ -213,6 +213,7 @@ impl StockWatchApp {
             quantity: 0.0,
             available_quantity: None,
             available_date: None,
+            intraday_cost_price: None,
             cost_price: 0.0,
             market: Market::Shenzhen,
         });
