@@ -320,10 +320,15 @@ impl StockWatchApp {
                 }
             });
         let cash = self.portfolio.cash();
+        let quote_date = self
+            .quotes
+            .last_updated_at
+            .map(|updated_at| updated_at.date_naive())
+            .unwrap_or_else(|| Local::now().date_naive());
         PortfolioTotals {
             total_assets: market_value + cash,
             position_pnl,
-            today_pnl,
+            today_pnl: today_pnl + self.portfolio.today_realized_pnl_for(quote_date),
         }
     }
 

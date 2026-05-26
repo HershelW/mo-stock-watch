@@ -85,7 +85,21 @@ pub struct Account {
     pub name: String,
     #[serde(default)]
     pub cash: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub today_realized_pnl: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub today_realized_pnl_date: Option<NaiveDate>,
     pub holdings: Vec<Holding>,
+}
+
+impl Account {
+    pub fn today_realized_pnl_for(&self, quote_date: NaiveDate) -> f64 {
+        if self.today_realized_pnl_date == Some(quote_date) {
+            self.today_realized_pnl
+        } else {
+            0.0
+        }
+    }
 }
 
 impl Default for Portfolio {
@@ -95,6 +109,8 @@ impl Default for Portfolio {
                 id: "default".to_owned(),
                 name: "默认账户".to_owned(),
                 cash: 0.0,
+                today_realized_pnl: 0.0,
+                today_realized_pnl_date: None,
                 holdings: vec![
                     Holding {
                         code: "600519".to_owned(),
@@ -131,6 +147,8 @@ impl Portfolio {
                 id: "default".to_owned(),
                 name: "默认账户".to_owned(),
                 cash: 0.0,
+                today_realized_pnl: 0.0,
+                today_realized_pnl_date: None,
                 holdings,
             }],
             last_saved_at,
@@ -157,6 +175,14 @@ impl Portfolio {
             .sum()
     }
 
+    pub fn today_realized_pnl_for(&self, quote_date: NaiveDate) -> f64 {
+        self.accounts
+            .iter()
+            .map(|account| account.today_realized_pnl_for(quote_date))
+            .filter(|pnl| pnl.is_finite())
+            .sum()
+    }
+
     pub fn push_holding_to_first_account(&mut self, holding: Holding) {
         self.ensure_account();
         self.accounts[0].holdings.push(holding);
@@ -177,6 +203,12 @@ impl Portfolio {
             }
             if !account.cash.is_finite() {
                 account.cash = 0.0;
+            }
+            if !account.today_realized_pnl.is_finite() {
+                account.today_realized_pnl = 0.0;
+            }
+            if is_zero(&account.today_realized_pnl) {
+                account.today_realized_pnl_date = None;
             }
 
             for holding in &mut account.holdings {
@@ -213,10 +245,16 @@ impl Portfolio {
                 id: "default".to_owned(),
                 name: "默认账户".to_owned(),
                 cash: 0.0,
+                today_realized_pnl: 0.0,
+                today_realized_pnl_date: None,
                 holdings: Vec::new(),
             });
         }
     }
+}
+
+fn is_zero(value: &f64) -> bool {
+    value.abs() < f64::EPSILON
 }
 
 fn sanitize_account_id(id: &str, idx: usize) -> String {
