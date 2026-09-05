@@ -7,3 +7,15 @@
 *.log
 portfolio.json
 settings.json
+/.codex/
+/private/
+/audit-output/
+__pycache__/
+*.pyc
+trade_ledger*
+ledger_history.json
+credentials.dat
+quote_cache.json
+*.joblib
+*.sqlite
+*.ipynb

@@ -1,8 +1,4 @@
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/app.ico");
@@ -18,37 +14,36 @@ fn main() {
         panic!("missing icon: {}", icon_path.display());
     }
 
-    let temp_dir = env::temp_dir().join(format!("mo-stock-watch-resource-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir).expect("create temp resource dir");
-    let temp_icon_path = temp_dir.join("app.ico");
-    let rc_path = temp_dir.join("app.rc");
-    let res_path = temp_dir.join("app.res");
+    let resource_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    fs::create_dir_all(&resource_dir).expect("create resource dir");
+    let temp_icon_path = resource_dir.join("app.ico");
+    let rc_path = resource_dir.join("app.rc");
+    let res_path = resource_dir.join("app.res");
     fs::copy(&icon_path, &temp_icon_path).expect("copy icon to temp resource dir");
 
-    let icon_path = escape_rc_path(&temp_icon_path);
-    fs::write(&rc_path, format!("1 ICON \"{icon_path}\"\n")).expect("write icon rc");
+    fs::write(&rc_path, "1 ICON \"app.ico\"\n").expect("write icon rc");
 
     let rc = find_rc().unwrap_or_else(|| PathBuf::from("rc.exe"));
     let status = Command::new(&rc)
+        .current_dir(&resource_dir)
         .arg("/nologo")
         .arg("/fo")
-        .arg(&res_path)
-        .arg(&rc_path)
+        .arg("app.res")
+        .arg("app.rc")
         .status()
         .expect("run Windows resource compiler");
 
     if !status.success() {
         panic!("resource compiler failed: {}", rc.display());
     }
+    if !res_path.exists() {
+        panic!("resource compiler did not create {}", res_path.display());
+    }
 
     println!(
         "cargo:rustc-link-arg-bin=mo-stock-watch={}",
         res_path.display()
     );
-}
-
-fn escape_rc_path(path: &Path) -> String {
-    path.display().to_string().replace('\\', "\\\\")
 }
 
 fn find_rc() -> Option<PathBuf> {

@@ -1,15 +1,28 @@
 use crate::portfolio::{Holding, Market};
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose, Engine as _};
+use chrono::NaiveDate;
 use serde_json::{json, Value};
 use std::{fs, path::Path, time::Duration};
+
+#[derive(Debug, Clone, Default)]
+pub struct RecognizedPortfolio {
+    pub holdings: Vec<Holding>,
+    pub broker: Option<String>,
+    pub account_name: Option<String>,
+    pub cash: Option<f64>,
+    pub total_assets: Option<f64>,
+    pub market_value: Option<f64>,
+    pub today_pnl: Option<f64>,
+    pub as_of_date: Option<NaiveDate>,
+}
 
 pub fn recognize_holdings_with_openai(
     api_key: &str,
     base_url: &str,
     model: &str,
     image_path: &Path,
-) -> anyhow::Result<Vec<Holding>> {
+) -> anyhow::Result<RecognizedPortfolio> {
     let api_key = api_key.trim();
     if api_key.is_empty() {
         bail!("请先填写 OpenAI API Key");
@@ -40,9 +53,22 @@ pub fn recognize_holdings_with_openai(
                     },
                     "required": ["code", "name", "quantity", "cost_price"]
                 }
+            },
+            "broker": {"type": ["string", "null"]},
+            "account_name": {"type": ["string", "null"]},
+            "cash": {"type": ["number", "null"]},
+            "total_assets": {"type": ["number", "null"]},
+            "market_value": {"type": ["number", "null"]},
+            "today_pnl": {"type": ["number", "null"]},
+            "as_of_date": {
+                "type": ["string", "null"],
+                "description": "Screenshot date in YYYY-MM-DD when visible or confidently known"
             }
         },
-        "required": ["holdings"]
+        "required": [
+            "holdings", "broker", "account_name", "cash", "total_assets",
+            "market_value", "today_pnl", "as_of_date"
+        ]
     });
 
     let body = json!({
@@ -52,7 +78,7 @@ pub fn recognize_holdings_with_openai(
                 "role": "system",
                 "content": [{
                     "type": "input_text",
-                    "text": "You extract A-share portfolio rows from Chinese brokerage screenshots. Return only confirmed holdings. Ignore totals, available cash, watchlists, and market quotes. If unsure about a row, omit it."
+                    "text": "You extract A-share brokerage portfolio snapshots. Read the broker/account label and account totals when visible, and keep the visible last four account digits in account_name. For each row, distinguish current price from cost price: Eastmoney-style screenshots show current/cost, while Caitong-style screenshots show cost/current. Return only confirmed holdings. Ignore zero-quantity cleared rows unless needed to reconcile a full screenshot."
                 }]
             },
             {
@@ -60,7 +86,7 @@ pub fn recognize_holdings_with_openai(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "Extract stock code, stock name, holding quantity, and cost price from this Tonghuashun or Eastmoney portfolio screenshot. Return JSON matching the schema."
+                        "text": "Extract the complete portfolio snapshot, including broker, account name with visible last four digits, available cash, total assets, market value, today's PnL, screenshot date if known, and stock code/name/holding quantity/cost price. Return JSON matching the schema."
                     },
                     {
                         "type": "input_image",
@@ -147,7 +173,19 @@ pub fn recognize_holdings_with_openai(
         .filter(|h| h.quantity > 0.0 && h.cost_price > 0.0)
         .collect();
 
-    Ok(holdings)
+    Ok(RecognizedPortfolio {
+        holdings,
+        broker: optional_text(&parsed, "broker"),
+        account_name: optional_text(&parsed, "account_name"),
+        cash: optional_number(&parsed, "cash"),
+        total_assets: optional_number(&parsed, "total_assets"),
+        market_value: optional_number(&parsed, "market_value"),
+        today_pnl: optional_number(&parsed, "today_pnl"),
+        as_of_date: parsed
+            .get("as_of_date")
+            .and_then(Value::as_str)
+            .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()),
+    })
 }
 
 pub fn fetch_models(api_key: &str, base_url: &str) -> anyhow::Result<Vec<String>> {
@@ -284,14 +322,14 @@ fn recognize_with_chat_completions(
         "messages": [
             {
                 "role": "system",
-                "content": "You extract A-share portfolio rows from Chinese brokerage screenshots. Return only JSON: {\"holdings\":[{\"code\":\"600519\",\"name\":\"贵州茅台\",\"quantity\":100,\"cost_price\":1500.0}]}. Ignore totals, available cash, watchlists, and market quotes."
+                "content": "You extract A-share brokerage portfolio snapshots. Return only JSON with holdings plus broker, account_name, cash, total_assets, market_value, today_pnl, and as_of_date. Keep the visible last four account digits in account_name. Distinguish current price from cost price: Eastmoney-style is current/cost; Caitong-style is cost/current."
             },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "Extract stock code, stock name, holding quantity, and cost price from this Tonghuashun or Eastmoney portfolio screenshot."
+                        "text": "Extract the complete brokerage portfolio snapshot and account totals from this screenshot. Preserve the visible account last four digits in account_name."
                     },
                     {
                         "type": "image_url",
@@ -372,4 +410,20 @@ fn image_mime(path: &Path) -> &'static str {
         Some("webp") => "image/webp",
         _ => "image/png",
     }
+}
+
+fn optional_text(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn optional_number(value: &Value, key: &str) -> Option<f64> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
 }
