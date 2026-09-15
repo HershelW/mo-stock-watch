@@ -931,20 +931,7 @@ impl StockWatchApp {
     }
 
     fn owner_options(&self) -> Vec<String> {
-        let mut seen = BTreeSet::new();
-        let mut options = Vec::new();
-        for label in [DEFAULT_OWNER, "A", "B", COMBINED_OWNER] {
-            if seen.insert(label.to_owned()) {
-                options.push(label.to_owned());
-            }
-        }
-        for account in &self.portfolio.accounts {
-            let owner = account.owner_label().to_owned();
-            if seen.insert(owner.clone()) {
-                options.push(owner);
-            }
-        }
-        options
+        owner_options_for(&self.portfolio.accounts)
     }
 
     fn ensure_selected_owner(&mut self) {
@@ -2913,6 +2900,22 @@ fn text_metric_card(
     ui.add_space(8.0);
 }
 
+fn owner_options_for(accounts: &[Account]) -> Vec<String> {
+    let owners = accounts
+        .iter()
+        .map(Account::owner_label)
+        .collect::<BTreeSet<_>>();
+    let mut options = vec![DEFAULT_OWNER.to_owned()];
+    options.extend(
+        owners
+            .into_iter()
+            .filter(|owner| *owner != DEFAULT_OWNER && *owner != COMBINED_OWNER)
+            .map(str::to_owned),
+    );
+    options.push(COMBINED_OWNER.to_owned());
+    options
+}
+
 fn monthly_portfolio_return(portfolio: &Portfolio) -> Option<f64> {
     let today = Local::now().date_naive();
     let month = portfolio
@@ -3075,6 +3078,24 @@ mod tests {
             .expect("valid date")
             .and_hms_opt(hour, minute, 0)
             .expect("valid time")
+    }
+
+    #[test]
+    fn unused_owner_partition_disappears_after_account_removal() {
+        let mut p = Portfolio::default();
+        let mut a = p.accounts[0].clone();
+        a.id = "a".into();
+        a.owner = "A".into();
+        let mut b = p.accounts[0].clone();
+        b.id = "b".into();
+        b.owner = "B".into();
+        p.accounts.extend([a, b]);
+        assert!(owner_options_for(&p.accounts).iter().any(|s| s == "A"));
+        p.accounts.retain(|a| a.owner != "A");
+        assert_eq!(
+            owner_options_for(&p.accounts),
+            vec![DEFAULT_OWNER, "B", COMBINED_OWNER]
+        );
     }
 
     #[test]
