@@ -228,7 +228,8 @@ impl PortfolioTotals {
 
     fn today_pnl_percent(self) -> Option<f64> {
         let previous_assets = self.total_assets - self.today_pnl;
-        (previous_assets.abs() > 0.005).then_some(self.today_pnl / previous_assets * 100.0)
+        (self.today_pnl.is_finite() && previous_assets.is_finite() && previous_assets > 0.005)
+            .then_some(self.today_pnl / previous_assets * 100.0)
     }
 }
 
@@ -1092,11 +1093,7 @@ impl StockWatchApp {
     fn render_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let totals = self.totals();
         let daily = self.daily_pnl_view();
-        let daily_percent = if daily.label == "今日估算" {
-            totals.today_pnl_percent()
-        } else {
-            daily.percent
-        };
+        let daily_percent = daily.percent;
         let palette = self.palette();
         Frame::new()
             .fill(palette.surface)
@@ -1144,6 +1141,14 @@ impl StockWatchApp {
                                     .strong(),
                             )
                             .on_hover_text(daily.tooltip());
+                            if let Some(percent) = daily_percent {
+                                ui.label(
+                                    RichText::new(format_percent(percent))
+                                        .small()
+                                        .color(self.pnl_color(daily.value)),
+                                )
+                                .on_hover_text(daily.tooltip());
+                            }
                         });
                         if compact_toggle_button(ui, self.settings.ultra_compact).clicked() {
                             self.set_ultra_compact(ctx, true);
@@ -1198,6 +1203,7 @@ impl StockWatchApp {
             .inner_margin(7.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     if compact_toggle_button(ui, self.settings.ultra_compact).clicked() {
                         self.set_ultra_compact(ctx, false);
                     }
@@ -1210,6 +1216,14 @@ impl StockWatchApp {
                             .color(self.pnl_color(daily.value)),
                     )
                     .on_hover_text(daily.tooltip());
+                    if let Some(percent) = daily.percent {
+                        ui.label(
+                            RichText::new(format_percent(percent))
+                                .small()
+                                .color(self.pnl_color(daily.value)),
+                        )
+                        .on_hover_text(daily.tooltip());
+                    }
                 });
             });
     }
@@ -2943,6 +2957,7 @@ fn daily_pnl_view(
     let mut details = Vec::new();
     let mut broker_count = 0;
     let mut percent = None;
+    let mut reference_assets = 0.0;
     let mut times = BTreeSet::new();
     for account in accounts {
         let estimate =
@@ -2952,6 +2967,7 @@ fn daily_pnl_view(
             broker_count += 1;
             times.insert(s.observed_at.format("%H:%M").to_string());
             value += s.today_pnl;
+            reference_assets += s.total_assets;
             if accounts.len() == 1 {
                 percent = s.today_pnl_percent;
             }
@@ -2963,6 +2979,21 @@ fn daily_pnl_view(
             ));
         } else {
             value += estimate;
+            reference_assets += account.cash
+                + account
+                    .matching_broker_snapshot()
+                    .map(|s| s.non_tradable_assets())
+                    .unwrap_or(0.0)
+                + account
+                    .holdings
+                    .iter()
+                    .try_fold(0.0, |sum, h| {
+                        quotes
+                            .get(&h.code)
+                            .filter(|q| q.updated_at.date_naive() == day)
+                            .map(|q| sum + q.market_value(h))
+                    })
+                    .unwrap_or(f64::NAN);
             let old = account
                 .broker_snapshot
                 .as_ref()
@@ -3009,6 +3040,15 @@ fn daily_pnl_view(
             accounts.len()
         )
     };
+    if percent.is_none() {
+        percent = PortfolioTotals {
+            total_assets: reference_assets,
+            today_pnl: value,
+            ..Default::default()
+        }
+        .today_pnl_percent();
+        details.push("百分比按各来源对应的资产基数汇总估算，不直接平均账户百分比。".into());
+    }
     DailyPnlView {
         value,
         label,
@@ -3259,7 +3299,7 @@ mod tests {
         );
         assert_eq!(mixed.value, 80.0); // The other account is cash-only, estimated zero.
         assert_eq!(mixed.label, "今日参考·混合");
-        assert!(mixed.percent.is_none());
+        assert!((mixed.percent.unwrap() - 80.0 / 70.0 * 100.0).abs() < 1e-6);
         let tomorrow = day.succ_opt().unwrap();
         assert_eq!(
             daily_pnl_view(&[&p.accounts[1]], &p.transactions, &quotes, tomorrow).label,
@@ -3336,6 +3376,37 @@ mod tests {
         };
 
         assert!(totals.today_pnl_percent().is_none());
+        assert!(PortfolioTotals {
+            total_assets: f64::NAN,
+            ..Default::default()
+        }
+        .today_pnl_percent()
+        .is_none());
+        assert!(PortfolioTotals {
+            total_assets: -100.0,
+            ..Default::default()
+        }
+        .today_pnl_percent()
+        .is_none());
+    }
+
+    #[test]
+    fn aggregate_daily_percentage_uses_source_capital_not_average_percent() {
+        let now = Local::now();
+        let make_account = |id: &str, assets: f64, reported_percent: f64| -> Account {
+            serde_json::from_value(serde_json::json!({
+                "id":id, "name":"Fixture", "cash":assets, "holdings":[],
+                "broker_snapshot":{"observed_at":now, "today_pnl":1000.0,
+                    "today_pnl_percent":reported_percent, "total_assets":assets,
+                    "market_value":0.0, "available_cash":assets, "holdings":[]}
+            }))
+            .unwrap()
+        };
+        let a = make_account("one", 11000.0, 10.0);
+        let b = make_account("two", 21000.0, 5.0);
+        let daily = daily_pnl_view(&[&a, &b], &[], &HashMap::new(), now.date_naive());
+        assert_eq!(daily.value, 2000.0);
+        assert!((daily.percent.unwrap() - 2000.0 / 30000.0 * 100.0).abs() < 1e-6);
     }
 
     #[test]
