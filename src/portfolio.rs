@@ -122,7 +122,70 @@ pub struct Account {
     pub today_realized_pnl: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub today_realized_pnl_date: Option<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_snapshot: Option<BrokerSnapshot>,
     pub holdings: Vec<Holding>,
+}
+
+/// Broker-reported values at one instant, not inferred fills or realized profit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerSnapshot {
+    pub observed_at: DateTime<Local>,
+    pub today_pnl: f64,
+    #[serde(default)]
+    pub today_pnl_percent: Option<f64>,
+    pub total_assets: f64,
+    pub market_value: f64,
+    pub available_cash: f64,
+    #[serde(default)]
+    pub frozen_cash: Option<f64>,
+    pub holdings: Vec<Holding>,
+}
+
+impl BrokerSnapshot {
+    pub fn non_tradable_assets(&self) -> f64 {
+        (self.total_assets - self.market_value - self.available_cash).max(0.0)
+    }
+
+    pub fn unclassified_assets(&self) -> f64 {
+        (self.non_tradable_assets() - self.frozen_cash.unwrap_or(0.0)).max(0.0)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if [
+            self.today_pnl,
+            self.total_assets,
+            self.market_value,
+            self.available_cash,
+        ]
+        .iter()
+        .any(|v| !v.is_finite())
+            || self.today_pnl_percent.is_some_and(|v| !v.is_finite())
+            || self.frozen_cash.is_some_and(|v| !v.is_finite() || v < 0.0)
+            || self.total_assets
+                - self.market_value
+                - self.available_cash
+                - self.frozen_cash.unwrap_or(0.0)
+                < -0.02
+        {
+            bail!("券商快照金额无效或冻结资金超出资产差额");
+        }
+        let mut codes = HashSet::new();
+        for h in &self.holdings {
+            if h.code.len() != 6
+                || !h.code.chars().all(|c| c.is_ascii_digit())
+                || !codes.insert(&h.code)
+                || !h.quantity.is_finite()
+                || h.quantity <= 0.0
+                || !h.cost_price.is_finite()
+                || h.available_quantity
+                    .is_some_and(|v| !v.is_finite() || v < 0.0 || v > h.quantity)
+            {
+                bail!("券商快照持仓无效");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -293,6 +356,27 @@ pub struct ReconcileSummary {
 }
 
 impl Account {
+    pub fn matching_broker_snapshot(&self) -> Option<&BrokerSnapshot> {
+        self.broker_snapshot.as_ref().filter(|s| {
+            (s.available_cash - self.cash).abs() < 0.005
+                && s.holdings.len() == self.holdings.len()
+                && self.holdings.iter().all(|h| {
+                    s.holdings.iter().any(|old| {
+                        old.code == h.code
+                            && (old.quantity - h.quantity).abs() < 0.000001
+                            && (old.cost_price - h.cost_price).abs() < 0.000001
+                            && old.available_quantity == h.available_quantity
+                            && old.available_date == h.available_date
+                    })
+                })
+        })
+    }
+
+    pub fn broker_snapshot_for(&self, date: NaiveDate) -> Option<&BrokerSnapshot> {
+        self.matching_broker_snapshot()
+            .filter(|s| s.observed_at.date_naive() == date)
+    }
+
     pub fn owner_label(&self) -> &str {
         if self.owner.trim().is_empty() {
             DEFAULT_OWNER
@@ -322,6 +406,7 @@ impl Default for Portfolio {
                 cash: 0.0,
                 today_realized_pnl: 0.0,
                 today_realized_pnl_date: None,
+                broker_snapshot: None,
                 holdings: Vec::new(),
             }],
             transactions: Vec::new(),
@@ -351,6 +436,9 @@ impl Portfolio {
             }
             if !account.cash.is_finite() || !account.today_realized_pnl.is_finite() {
                 bail!("账户金额无效");
+            }
+            if let Some(snapshot) = &account.broker_snapshot {
+                snapshot.validate()?;
             }
             let mut codes = HashSet::new();
             for h in &account.holdings {
@@ -450,6 +538,7 @@ impl Portfolio {
                 cash: 0.0,
                 today_realized_pnl: 0.0,
                 today_realized_pnl_date: None,
+                broker_snapshot: None,
                 holdings,
             }],
             transactions: Vec::new(),
@@ -648,6 +737,8 @@ impl Portfolio {
             }
         }
 
+        // Even a round-trip trade can change daily profit without changing final positions.
+        account.broker_snapshot = None;
         if transaction.id.trim().is_empty() {
             transaction.id = self.next_id("tx");
         }
@@ -735,6 +826,7 @@ impl Portfolio {
         if let Some(cash) = cash.filter(|cash| cash.is_finite()) {
             account.cash = cash;
         }
+        account.broker_snapshot = None;
 
         for (code, name, quantity) in events {
             let price = incoming
@@ -918,6 +1010,7 @@ impl Portfolio {
                 cash: 0.0,
                 today_realized_pnl: 0.0,
                 today_realized_pnl_date: None,
+                broker_snapshot: None,
                 holdings: Vec::new(),
             });
         }
@@ -1043,6 +1136,7 @@ mod tests {
                 cash,
                 today_realized_pnl: 0.0,
                 today_realized_pnl_date: None,
+                broker_snapshot: None,
                 holdings: Vec::new(),
             }],
             transactions: Vec::new(),
@@ -1078,6 +1172,42 @@ mod tests {
         portfolio.accounts[0].owner.clear();
         portfolio.normalize();
         assert_eq!(portfolio.accounts[0].owner_label(), DEFAULT_OWNER);
+    }
+
+    #[test]
+    fn frozen_and_unclassified_assets_are_not_income_or_spendable_cash() {
+        let mut p = empty_portfolio(100.0);
+        let s = BrokerSnapshot {
+            observed_at: Local::now(),
+            today_pnl: 12.0,
+            today_pnl_percent: None,
+            total_assets: 1100.0,
+            market_value: 0.0,
+            available_cash: 100.0,
+            frozen_cash: None,
+            holdings: Vec::new(),
+        };
+        assert_eq!(s.non_tradable_assets(), 1000.0);
+        assert_eq!(s.unclassified_assets(), 1000.0);
+        p.accounts[0].broker_snapshot = Some(s);
+        p.validate().unwrap();
+        assert_eq!(p.accounts[0].cash, 100.0);
+        assert_eq!(p.accounts[0].today_realized_pnl, 0.0);
+        p.accounts[0].broker_snapshot.as_mut().unwrap().frozen_cash = Some(1000.0);
+        assert_eq!(
+            p.accounts[0]
+                .matching_broker_snapshot()
+                .unwrap()
+                .unclassified_assets(),
+            0.0
+        );
+        p.accounts[0].broker_snapshot.as_mut().unwrap().frozen_cash = Some(1100.0);
+        assert!(p.validate().is_err());
+        p.accounts[0].broker_snapshot.as_mut().unwrap().frozen_cash = Some(1000.0);
+        let mut t = transaction(TransactionKind::Deposit, 0.0, 0.0);
+        t.cash_amount = 10.0;
+        p.apply_transaction(t).unwrap();
+        assert!(p.accounts[0].broker_snapshot.is_none());
     }
 
     #[test]

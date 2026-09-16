@@ -17,6 +17,29 @@ def holding(q=100):
 
 
 class PortfolioTests(unittest.TestCase):
+    def test_broker_snapshot_is_not_a_trade_or_realized_profit(self):
+        p = fixture()
+        s = {'today_pnl': 120.0, 'total_assets': 11000.0, 'market_value': 0.0,
+             'available_cash': 10000.0, 'frozen_cash': None}
+        batch = {'expected_hash': ops.state_hash(p), 'observed_at': '2026-09-01T13:39:00+08:00',
+                 'accounts': [{'suffix': '1234', 'cash': 10000, 'holdings': [], 'broker_snapshot': s}]}
+        updated = ops.apply_batch(p, batch)
+        snap = updated['accounts'][0]['broker_snapshot']
+        self.assertEqual(snap['today_pnl'], 120.0)
+        self.assertIsNone(snap['frozen_cash'])
+        self.assertEqual(updated['transactions'], [])
+        self.assertEqual(updated['accounts'][0].get('today_realized_pnl', 0), 0)
+        self.assertEqual(ops.build_ledger(updated, [])['summaries'][0]['broker_snapshot'], snap)
+        for mutate in [lambda x: x['accounts'][0]['broker_snapshot'].update(frozen_cash=2000),
+                       lambda x: x['accounts'][0]['broker_snapshot'].update(today_pnl=float('nan')),
+                       lambda x: x['accounts'][0]['broker_snapshot'].update(observed_at='bad')]:
+            bad = copy.deepcopy(updated); mutate(bad)
+            with self.assertRaises((ValueError, TypeError)): ops.validate_portfolio(bad)
+        batch['expected_hash'] = ops.state_hash(updated)
+        batch['accounts'][0].pop('broker_snapshot')
+        refreshed = ops.apply_batch(updated, batch)
+        self.assertNotIn('broker_snapshot', refreshed['accounts'][0])
+
     def test_update_idempotence_unknown_evidence_and_cash_account(self):
         p = fixture()
         batch = {'expected_hash': ops.state_hash(p), 'observed_at': '2026-09-01T10:00:00+08:00',

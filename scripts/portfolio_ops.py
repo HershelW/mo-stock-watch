@@ -101,6 +101,20 @@ def validate_portfolio(p):
                 check_date(h.get("available_date"))
             if h.get("intraday_cost_price") is not None:
                 number(h["intraday_cost_price"], "intraday cost", 0.000001)
+        if a.get("broker_snapshot") is not None:
+            s = a['broker_snapshot']
+            timestamp(s['observed_at'])
+            for field in ('today_pnl', 'total_assets', 'market_value', 'available_cash'):
+                number(s.get(field), 'broker ' + field)
+            if s.get('today_pnl_percent') is not None:
+                number(s['today_pnl_percent'], 'broker day percent')
+            if s.get('frozen_cash') is not None:
+                number(s['frozen_cash'], 'frozen cash', 0)
+            if s['total_assets'] - s['market_value'] - s['available_cash'] - (s.get('frozen_cash') or 0) < -0.02:
+                raise ValueError('Broker frozen cash exceeds asset residual')
+            # Reuse position validation without recursively nesting another snapshot.
+            validate_portfolio({'accounts': [{'id': 'snapshot', 'name': '', 'cash': s['available_cash'],
+                'holdings': s.get('holdings')}], 'transactions': []})
     for tx in p["transactions"]:
         if not tx.get("id") or tx["id"] in txids or tx.get("account_id") not in ids:
             raise ValueError("Duplicate/empty transaction ID or unknown account")
@@ -158,7 +172,8 @@ def build_ledger(p, history):
     positions = [{"account_id": a["id"], "owner": a.get("owner") or "我的", "broker": a["name"],
                   "suffix": a.get("account_suffix", ""), **h} for a in p["accounts"] for h in a["holdings"]]
     summaries = [{"account_id": a["id"], "owner": a.get("owner") or "我的", "broker": a["name"],
-                  "suffix": a.get("account_suffix", ""), "cash": a["cash"], "holdings": len(a["holdings"])}
+                  "suffix": a.get("account_suffix", ""), "cash": a["cash"], "holdings": len(a["holdings"]),
+                  "broker_snapshot": a.get("broker_snapshot")}
                  for a in p["accounts"]]
     return {"version": 2, "portfolio_hash": state_hash(p), "updated_at": datetime.now(timezone.utc).isoformat(),
             "history_hash": digest(history), "rows": rows, "positions": positions, "summaries": summaries}
@@ -275,6 +290,8 @@ def apply_batch(p, batch):
                 "note": "截图推断/待核；观察日归档，成交时间未知。" + update.get("note", "")})
         a["cash"] = update["cash"]
         a["holdings"] = incoming
+        # A newer account observation without daily PnL must not silently reuse an older quote.
+        a.pop('broker_snapshot', None)
     for tx in supplied:
         if tx["id"] in txids:
             raise ValueError("Duplicate transaction ID")
@@ -285,6 +302,19 @@ def apply_batch(p, batch):
         tx.setdefault("realized_pnl", None)
         result["transactions"].append(tx)
     repair_intraday(result)
+    for update in batch['accounts']:
+        if update.get('broker_snapshot') is not None:
+            a = next(a for a in result['accounts'] if a.get('account_suffix') == update['suffix'])
+            s = copy.deepcopy(update['broker_snapshot'])
+            s.setdefault('observed_at', batch['observed_at'])
+            s.setdefault('today_pnl_percent', None)
+            s.setdefault('frozen_cash', None)
+            if abs(s['available_cash'] - a['cash']) >= 0.005:
+                raise ValueError('Broker snapshot and available cash differ')
+            if timestamp(s['observed_at']) > observed:
+                raise ValueError('Broker snapshot is later than batch observation')
+            s['holdings'] = copy.deepcopy(a['holdings'])
+            a['broker_snapshot'] = s
     result["last_saved_at"] = datetime.now().astimezone().isoformat()
     validate_portfolio(result)
     return result

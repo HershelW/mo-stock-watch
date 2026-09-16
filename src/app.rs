@@ -17,7 +17,7 @@ use eframe::egui::{
 };
 use image::{ImageBuffer, Rgba};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::PathBuf,
     sync::mpsc::Receiver,
@@ -200,6 +200,25 @@ struct PortfolioTotals {
     market_value: f64,
     position_pnl: f64,
     today_pnl: f64,
+}
+
+struct DailyPnlView {
+    value: f64,
+    label: &'static str,
+    percent: Option<f64>,
+    details: Vec<String>,
+    caption: String,
+}
+
+impl DailyPnlView {
+    fn tooltip(&self) -> String {
+        format!(
+            "{} · {}\n{}",
+            self.label,
+            self.caption,
+            self.details.join("\n")
+        )
+    }
 }
 
 impl PortfolioTotals {
@@ -523,6 +542,7 @@ impl StockWatchApp {
                     cash: 0.0,
                     today_realized_pnl: 0.0,
                     today_realized_pnl_date: None,
+                    broker_snapshot: None,
                     holdings: Vec::new(),
                 });
                 self.portfolio.accounts.len() - 1
@@ -862,62 +882,49 @@ impl StockWatchApp {
             .iter()
             .filter(|account| account_matches_owner(account, owner))
             .collect::<Vec<_>>();
-        let (market_value, position_pnl, today_pnl) = accounts
+        let (market_value, position_pnl) = accounts
             .iter()
             .flat_map(|account| account.holdings.iter())
-            .fold((0.0, 0.0, 0.0), |acc, h| {
+            .fold((0.0, 0.0), |acc, h| {
                 if let Some(q) = self.quotes.quotes.get(&h.code) {
-                    (
-                        acc.0 + q.market_value(h),
-                        acc.1 + q.position_pnl(h),
-                        acc.2 + q.today_pnl(h),
-                    )
+                    (acc.0 + q.market_value(h), acc.1 + q.position_pnl(h))
                 } else {
-                    (f64::NAN, f64::NAN, f64::NAN)
+                    (f64::NAN, f64::NAN)
                 }
             });
         let cash = self.cash_for_owner(owner);
-        let quote_date = self
-            .quotes
-            .last_updated_at
-            .map(|updated_at| updated_at.date_naive())
-            .unwrap_or_else(|| Local::now().date_naive());
-        let account_ids = accounts
+        let day = Local::now().date_naive();
+        let today_pnl = accounts.iter().try_fold(0.0, |sum, a| {
+            account_daily_estimate(a, &self.portfolio.transactions, &self.quotes.quotes, day)
+                .map(|value| sum + value)
+        });
+        // Available cash excludes reservations and other broker-reported assets.
+        let non_tradable = accounts
             .iter()
-            .map(|account| account.id.as_str())
-            .collect::<HashSet<_>>();
-        let manual_realized = accounts
-            .iter()
-            .map(|account| account.today_realized_pnl_for(quote_date))
-            .filter(|pnl| pnl.is_finite())
+            .filter_map(|a| a.matching_broker_snapshot())
+            .map(|s| s.non_tradable_assets())
             .sum::<f64>();
-        let ledger_daily = self
-            .portfolio
-            .transactions
-            .iter()
-            .filter(|transaction| {
-                transaction.date == quote_date
-                    && account_ids.contains(transaction.account_id.as_str())
-                    && matches!(
-                        transaction.kind,
-                        TransactionKind::Sell | TransactionKind::Dividend | TransactionKind::Fee
-                    )
-            })
-            .map(|transaction| {
-                transaction.daily_pnl(
-                    self.quotes
-                        .quotes
-                        .get(&transaction.code)
-                        .map(|q| q.previous_close),
-                )
-            })
-            .try_fold(0.0, |sum, item| item.map(|value| sum + value));
         PortfolioTotals {
-            total_assets: market_value + cash,
+            total_assets: market_value + cash + non_tradable,
             market_value,
             position_pnl,
-            today_pnl: today_pnl + manual_realized + ledger_daily.unwrap_or(f64::NAN),
+            today_pnl: today_pnl.unwrap_or(f64::NAN),
         }
+    }
+
+    fn daily_pnl_view(&self) -> DailyPnlView {
+        let accounts = self
+            .portfolio
+            .accounts
+            .iter()
+            .filter(|a| account_matches_owner(a, &self.selected_owner))
+            .collect::<Vec<_>>();
+        daily_pnl_view(
+            &accounts,
+            &self.portfolio.transactions,
+            &self.quotes.quotes,
+            Local::now().date_naive(),
+        )
     }
 
     fn cash_for_owner(&self, owner: &str) -> f64 {
@@ -1084,6 +1091,12 @@ impl StockWatchApp {
 
     fn render_header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let totals = self.totals();
+        let daily = self.daily_pnl_view();
+        let daily_percent = if daily.label == "今日估算" {
+            totals.today_pnl_percent()
+        } else {
+            daily.percent
+        };
         let palette = self.palette();
         Frame::new()
             .fill(palette.surface)
@@ -1125,11 +1138,12 @@ impl StockWatchApp {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("今日").color(palette.text_muted));
                             ui.label(
-                                RichText::new(format_money(totals.today_pnl))
+                                RichText::new(format_money(daily.value))
                                     .monospace()
-                                    .color(self.pnl_color(totals.today_pnl))
+                                    .color(self.pnl_color(daily.value))
                                     .strong(),
-                            );
+                            )
+                            .on_hover_text(daily.tooltip());
                         });
                         if compact_toggle_button(ui, self.settings.ultra_compact).clicked() {
                             self.set_ultra_compact(ctx, true);
@@ -1157,21 +1171,25 @@ impl StockWatchApp {
                         None,
                         palette,
                     );
-                    metric_card(
-                        ui,
-                        "今日盈亏",
-                        totals.today_pnl,
-                        self.pnl_color(totals.today_pnl),
-                        self.settings.font_scale,
-                        totals.today_pnl_percent(),
-                        palette,
-                    );
+                    ui.scope(|ui| {
+                        metric_card(
+                            ui,
+                            "今日盈亏",
+                            daily.value,
+                            self.pnl_color(daily.value),
+                            self.settings.font_scale,
+                            daily_percent,
+                            palette,
+                        );
+                    })
+                    .response
+                    .on_hover_text(daily.tooltip());
                 });
             });
     }
 
     fn render_ultra_compact(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let totals = self.totals();
+        let daily = self.daily_pnl_view();
         let palette = self.palette();
         Frame::new()
             .fill(palette.surface)
@@ -1183,15 +1201,15 @@ impl StockWatchApp {
                     if compact_toggle_button(ui, self.settings.ultra_compact).clicked() {
                         self.set_ultra_compact(ctx, false);
                     }
-                    ui.label(RichText::new("今日").small().color(palette.text_muted));
+                    ui.label(RichText::new("今日盈亏").small().color(palette.text_muted));
                     ui.label(
-                        RichText::new(format_money(totals.today_pnl))
+                        RichText::new(format_money(daily.value))
                             .monospace()
                             .size(16.5 * self.settings.font_scale)
                             .strong()
-                            .color(self.pnl_color(totals.today_pnl)),
-                    );
-                    today_pnl_percent_label(ui, totals, self.settings.font_scale * 0.95, palette);
+                            .color(self.pnl_color(daily.value)),
+                    )
+                    .on_hover_text(daily.tooltip());
                 });
             });
     }
@@ -2786,7 +2804,7 @@ fn compact_toggle_button(ui: &mut egui::Ui, active: bool) -> egui::Response {
         );
     }
 
-    response.on_hover_text("究极缩小：只显示今日浮盈")
+    response.on_hover_text("究极缩小：显示今日盈亏参考和数据来源")
 }
 
 fn metric_card(
@@ -2830,22 +2848,6 @@ fn metric_card(
         });
     });
     ui.add_space(8.0);
-}
-
-fn today_pnl_percent_label(
-    ui: &mut egui::Ui,
-    totals: PortfolioTotals,
-    scale: f32,
-    palette: ThemePalette,
-) {
-    if let Some(percent) = totals.today_pnl_percent() {
-        ui.label(
-            RichText::new(format_percent(percent))
-                .monospace()
-                .size(10.5 * scale)
-                .color(pnl_color_for(totals.today_pnl, palette)),
-        );
-    }
 }
 
 fn position_badge(ui: &mut egui::Ui, percent: Option<f64>, scale: f32, palette: ThemePalette) {
@@ -2898,6 +2900,122 @@ fn text_metric_card(
             );
         });
     ui.add_space(8.0);
+}
+
+fn account_daily_estimate(
+    account: &Account,
+    transactions: &[Transaction],
+    quotes: &HashMap<String, quote::Quote>,
+    day: NaiveDate,
+) -> Option<f64> {
+    let mut value = account.today_realized_pnl_for(day);
+    for h in &account.holdings {
+        let q = quotes
+            .get(&h.code)
+            .filter(|q| q.updated_at.date_naive() == day)?;
+        value += q.today_pnl(h);
+    }
+    for tx in transactions.iter().filter(|t| {
+        t.account_id == account.id
+            && t.date == day
+            && matches!(
+                t.kind,
+                TransactionKind::Sell | TransactionKind::Dividend | TransactionKind::Fee
+            )
+    }) {
+        value += tx.daily_pnl(
+            quotes
+                .get(&tx.code)
+                .filter(|q| q.updated_at.date_naive() == day)
+                .map(|q| q.previous_close),
+        )?;
+    }
+    value.is_finite().then_some(value)
+}
+
+fn daily_pnl_view(
+    accounts: &[&Account],
+    transactions: &[Transaction],
+    quotes: &HashMap<String, quote::Quote>,
+    day: NaiveDate,
+) -> DailyPnlView {
+    let mut value = 0.0;
+    let mut details = Vec::new();
+    let mut broker_count = 0;
+    let mut percent = None;
+    let mut times = BTreeSet::new();
+    for account in accounts {
+        let estimate =
+            account_daily_estimate(account, transactions, quotes, day).unwrap_or(f64::NAN);
+        let name = format!("{} {}", account.name, account.account_suffix);
+        if let Some(s) = account.broker_snapshot_for(day) {
+            broker_count += 1;
+            times.insert(s.observed_at.format("%H:%M").to_string());
+            value += s.today_pnl;
+            if accounts.len() == 1 {
+                percent = s.today_pnl_percent;
+            }
+            details.push(format!(
+                "{name}：券商今日 {:+.2}（{} 截图）；实时估算 {}",
+                s.today_pnl,
+                s.observed_at.format("%H:%M"),
+                format_money(estimate)
+            ));
+        } else {
+            value += estimate;
+            let old = account
+                .broker_snapshot
+                .as_ref()
+                .map(|s| {
+                    format!(
+                        "；{}快照已过期或持仓已变",
+                        s.observed_at.format("%m-%d %H:%M")
+                    )
+                })
+                .unwrap_or_default();
+            details.push(format!(
+                "{name}：今日实时估算 {}{old}",
+                format_money(estimate)
+            ));
+        }
+        if let Some(s) = account
+            .matching_broker_snapshot()
+            .filter(|s| s.non_tradable_assets() > 0.005)
+        {
+            details.push(format!(
+                "{name}：冻结 {}，其他资产/待核差额 {:.2}（{}；不计收益）",
+                s.frozen_cash
+                    .map(|n| format!("{n:.2}"))
+                    .unwrap_or_else(|| "待核".into()),
+                s.unclassified_assets(),
+                s.observed_at.format("%m-%d %H:%M")
+            ));
+        }
+    }
+    let label = if broker_count == 0 {
+        "今日估算"
+    } else if broker_count == accounts.len() {
+        "券商今日·截图"
+    } else {
+        "今日参考·混合"
+    };
+    let caption = if broker_count == 0 {
+        "实时估算；行情或成交不足时待核".into()
+    } else {
+        format!(
+            "{}截图 · {}/{}账户；不随行情刷新",
+            times.into_iter().collect::<Vec<_>>().join("/"),
+            broker_count,
+            accounts.len()
+        )
+    };
+    DailyPnlView {
+        value,
+        label,
+        percent,
+        details,
+        caption,
+    }
 }
 
 fn owner_options_for(accounts: &[Account]) -> Vec<String> {
@@ -3099,6 +3217,64 @@ mod tests {
     }
 
     #[test]
+    fn broker_pnl_is_timestamped_and_mixed_coverage_is_explicit() {
+        let day = Local::now().date_naive();
+        let mut p = Portfolio::default();
+        let mut second = p.accounts[0].clone();
+        second.id = "broker".into();
+        second.name = "Fixture broker".into();
+        second.account_suffix = "1234".into();
+        second.cash = 100.0;
+        second.broker_snapshot = Some(crate::portfolio::BrokerSnapshot {
+            observed_at: Local::now(),
+            today_pnl: 80.0,
+            today_pnl_percent: Some(2.0),
+            total_assets: 150.0,
+            market_value: 0.0,
+            available_cash: 100.0,
+            frozen_cash: None,
+            holdings: Vec::new(),
+        });
+        p.accounts.push(second);
+        p.transactions.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"pending-sale", "account_id":"broker", "date":day, "kind":"Sell",
+                "code":"600000", "quantity":100.0, "price":0.0
+            }))
+            .unwrap(),
+        );
+        let quotes = HashMap::new();
+        assert!(account_daily_estimate(&p.accounts[1], &p.transactions, &quotes, day).is_none());
+        let broker = daily_pnl_view(&[&p.accounts[1]], &p.transactions, &quotes, day);
+        assert_eq!(broker.value, 80.0);
+        assert_eq!(broker.percent, Some(2.0));
+        assert_eq!(broker.label, "券商今日·截图");
+        assert!(broker.details[0].contains("实时估算 待核"));
+        assert!(broker.details[1].contains("其他资产/待核差额 50.00"));
+        let mixed = daily_pnl_view(
+            &p.accounts.iter().collect::<Vec<_>>(),
+            &p.transactions,
+            &quotes,
+            day,
+        );
+        assert_eq!(mixed.value, 80.0); // The other account is cash-only, estimated zero.
+        assert_eq!(mixed.label, "今日参考·混合");
+        assert!(mixed.percent.is_none());
+        let tomorrow = day.succ_opt().unwrap();
+        assert_eq!(
+            daily_pnl_view(&[&p.accounts[1]], &p.transactions, &quotes, tomorrow).label,
+            "今日估算"
+        );
+        p.accounts[1].cash += 1.0;
+        assert!(p.accounts[1].matching_broker_snapshot().is_none());
+        assert!(
+            daily_pnl_view(&[&p.accounts[1]], &p.transactions, &quotes, day)
+                .value
+                .is_nan()
+        );
+    }
+
+    #[test]
     fn monthly_returns_use_same_owner_flows_and_endpoint_levels() {
         let mut p = Portfolio::default();
         let mut other = p.accounts[0].clone();
@@ -3188,6 +3364,7 @@ mod tests {
             cash: 0.0,
             today_realized_pnl: 0.0,
             today_realized_pnl_date: None,
+            broker_snapshot: None,
             holdings: Vec::new(),
         };
 

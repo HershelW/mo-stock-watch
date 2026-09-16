@@ -36,6 +36,26 @@
 
 有真实成交单时可提供 `transactions`（与应用 Transaction 字段一致），包括唯一 id、account_id、date、kind、code/name/market、quantity、price、fees、cash_amount、realized_pnl、note 和 execution。`execution` 包含 confidence、price_basis、fees_known、date_is_estimated、executed_at、observed_at；确实知道才用 Confirmed/fill，未知盈亏为 null。成交净数量必须解释该账户最终持仓变化。
 
+## 券商今日盈亏与冻结资金
+
+每张截图可见今日参考盈亏时，在对应账户更新中传入 `broker_snapshot`，即使股数未变也要更新这个带时间的观察值：
+
+```json
+{
+  "observed_at": "2026-09-01T13:39:00+08:00",
+  "today_pnl": 120.0,
+  "today_pnl_percent": 1.2,
+  "total_assets": 11000.0,
+  "market_value": 9000.0,
+  "available_cash": 1000.0,
+  "frozen_cash": null
+}
+```
+
+只有明确的冻结金额才填 `frozen_cash`，未知为 null；资产差额不是手续费、出入金或已实现收益。例中另有 1000 元资产待分类，仍属于账户资产，但不可当作可用现金。持仓绑定由更新器自动保存，无需手填。
+
+界面“今日盈亏”优先使用当天、且仍匹配现金和持仓的券商快照；其他账户用实时估算。鼠标悬停查看“混合”标记、每个账户的来源和时间，不常驻显示明细。静态截图不冒充实时结果。隔日或持仓/现金变化后失效；无快照的新账户观察会清掉该账户旧快照。截图值不写入 `today_realized_pnl`，也不生成新交易，不用于冒充实时 NAV 历史。
+
 ## 校验和恢复
 
 - 更新器关闭**固定路径**的程序，创建时间戳备份，再在共享锁内更新；检测到其他路径的旧程序会停止。
