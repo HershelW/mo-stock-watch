@@ -1,6 +1,9 @@
-use crate::portfolio::{Holding, Market};
+use crate::{
+    clock::{self, BEIJING},
+    portfolio::{Holding, Market},
+};
 use anyhow::{bail, Context};
-use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
 use encoding_rs::GBK;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,7 +17,7 @@ use std::{
 #[derive(Debug, Clone, Default)]
 pub struct QuoteBook {
     pub quotes: HashMap<String, Quote>,
-    pub last_updated_at: Option<DateTime<Local>>,
+    pub last_updated_at: Option<DateTime<FixedOffset>>,
     pub last_error: Option<String>,
     pub loading: bool,
 }
@@ -49,7 +52,7 @@ pub struct Quote {
     pub price: f64,
     pub previous_close: f64,
     pub change_percent: f64,
-    pub updated_at: DateTime<Local>,
+    pub updated_at: DateTime<FixedOffset>,
     #[serde(default)]
     pub open: Option<f64>,
     #[serde(default)]
@@ -74,7 +77,7 @@ impl Quote {
     }
 
     pub fn today_pnl(&self, holding: &Holding) -> f64 {
-        let quote_date = self.updated_at.date_naive();
+        let quote_date = self.updated_at.with_timezone(&BEIJING).date_naive();
         let overnight_quantity = holding.overnight_quantity_for(quote_date);
         let intraday_quantity = holding.intraday_quantity_for(quote_date);
         let intraday_cost_price = holding.intraday_cost_price_for(quote_date);
@@ -102,9 +105,12 @@ pub fn load_cache() -> QuoteBook {
     let Ok(raw) = fs::read_to_string(path) else {
         return QuoteBook::default();
     };
-    let Ok(quotes) = serde_json::from_str::<Vec<Quote>>(&raw) else {
+    let Ok(mut quotes) = serde_json::from_str::<Vec<Quote>>(&raw) else {
         return QuoteBook::default();
     };
+    for quote in &mut quotes {
+        quote.updated_at = quote.updated_at.with_timezone(&BEIJING);
+    }
     let last_updated_at = quotes.iter().map(|quote| quote.updated_at).min();
     QuoteBook {
         quotes: quotes
@@ -259,7 +265,7 @@ fn fetch_eastmoney_quotes(holdings: &[Holding]) -> anyhow::Result<Vec<Quote>> {
                 change_percent: row.change_percent.unwrap_or_default(),
                 updated_at: DateTime::from_timestamp(row.timestamp.unwrap_or(0), 0)
                     .unwrap_or_default()
-                    .with_timezone(&Local),
+                    .with_timezone(&BEIJING),
                 open: row.open,
                 high: row.high,
                 low: row.low,
@@ -300,7 +306,7 @@ fn fetch_yahoo_kospi() -> anyhow::Result<Quote> {
         price,
         previous_close,
         change_percent: (price - previous_close) / previous_close * 100.0,
-        updated_at: Local::now(),
+        updated_at: clock::now(),
         open: None,
         high: None,
         low: None,
@@ -336,7 +342,7 @@ fn fetch_tencent_quotes(holdings: &[Holding]) -> anyhow::Result<Vec<Quote>> {
         .context("read tencent response")?;
     let text = decode_gbk(&bytes);
 
-    let now = Local::now();
+    let now = clock::now();
     Ok(text
         .lines()
         .filter_map(|line| parse_tencent_quote_line(line, now))
@@ -366,7 +372,7 @@ fn fetch_sina_quotes(holdings: &[Holding]) -> anyhow::Result<Vec<Quote>> {
         .context("read sina response")?;
     let text = decode_gbk(&bytes);
 
-    let now = Local::now();
+    let now = clock::now();
     Ok(text
         .lines()
         .filter_map(|line| parse_sina_quote_line(line, now))
@@ -382,7 +388,7 @@ fn prefixed_symbol(market: Market, code: &str) -> String {
     format!("{prefix}{code}")
 }
 
-fn parse_tencent_quote_line(line: &str, _received_at: DateTime<Local>) -> Option<Quote> {
+fn parse_tencent_quote_line(line: &str, _received_at: DateTime<FixedOffset>) -> Option<Quote> {
     let content = line.split_once('"')?.1.rsplit_once('"')?.0;
     let fields = content.split('~').collect::<Vec<_>>();
     let updated_at = provider_time(fields.get(30).copied().unwrap_or(""), "%Y%m%d%H%M%S");
@@ -416,7 +422,7 @@ fn parse_tencent_quote_line(line: &str, _received_at: DateTime<Local>) -> Option
     })
 }
 
-fn parse_sina_quote_line(line: &str, _received_at: DateTime<Local>) -> Option<Quote> {
+fn parse_sina_quote_line(line: &str, _received_at: DateTime<FixedOffset>) -> Option<Quote> {
     let var_name = line.split_once('=')?.0;
     let code = var_name
         .chars()
@@ -466,16 +472,12 @@ fn parse_sina_quote_line(line: &str, _received_at: DateTime<Local>) -> Option<Qu
     })
 }
 
-fn provider_time(value: &str, format: &str) -> DateTime<Local> {
+fn provider_time(value: &str, format: &str) -> DateTime<FixedOffset> {
     NaiveDateTime::parse_from_str(value, format)
         .ok()
-        .and_then(|t| {
-            FixedOffset::east_opt(8 * 3600)?
-                .from_local_datetime(&t)
-                .single()
-        })
-        .map(|t| t.with_timezone(&Local))
-        .unwrap_or_else(|| DateTime::UNIX_EPOCH.with_timezone(&Local))
+        .and_then(|t| BEIJING.from_local_datetime(&t).single())
+        .map(|t| t.with_timezone(&BEIJING))
+        .unwrap_or_else(|| DateTime::UNIX_EPOCH.with_timezone(&BEIJING))
 }
 
 fn parse_f64(value: &str) -> Option<f64> {
@@ -565,6 +567,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tokyo_midnight_does_not_roll_over_beijing_intraday_holdings() {
+        let holding: Holding = serde_json::from_value(serde_json::json!({
+            "code":"600000", "name":"fixture", "quantity":100, "cost_price":11,
+            "available_quantity":0, "available_date":"2026-10-21", "intraday_cost_price":11
+        }))
+        .unwrap();
+        let quote: Quote = serde_json::from_value(serde_json::json!({
+            "code":"600000", "name":"fixture", "price":12, "previous_close":10,
+            "change_percent":20, "updated_at":"2026-10-22T00:30:00+09:00"
+        }))
+        .unwrap();
+        assert_eq!(quote.today_pnl(&holding), 100.0);
+        assert_eq!(
+            provider_time("20261021093000", "%Y%m%d%H%M%S")
+                .format("%H:%M %:z")
+                .to_string(),
+            "09:30 +08:00"
+        );
+    }
+
+    #[test]
     fn partial_or_invalid_quotes_do_not_cover_a_portfolio() {
         let holding: Holding = serde_json::from_value(serde_json::json!({
             "code":"600000", "name":"fixture", "quantity":100, "cost_price":10
@@ -572,7 +595,7 @@ mod tests {
         .unwrap();
         let quote: Quote = serde_json::from_value(serde_json::json!({
             "code":"600000", "name":"fixture", "price":10, "previous_close":9,
-            "change_percent":11.1, "updated_at":Local::now()
+            "change_percent":11.1, "updated_at":clock::now()
         }))
         .unwrap();
         assert!(quotes_cover_targets(&[holding.clone()], &[quote.clone()]));
@@ -602,7 +625,7 @@ mod tests {
 
     #[test]
     fn parses_tencent_quote_line() {
-        let now = Local.with_ymd_and_hms(2026, 4, 29, 10, 35, 48).unwrap();
+        let now = BEIJING.with_ymd_and_hms(2026, 4, 29, 10, 35, 48).unwrap();
         let line = "v_sh600519=\"1~贵州茅台~600519~1501.00~1500.00~1498.00~57319~28788~28492~1500.50~5~1500.00~14~1499.50~3~1499.00~10~1498.50~2~1501.00~1~1501.50~15~1502.00~1~1502.50~13~1503.00~86~~20260429103548~1.00~0.07~1510.00~1490.00\";";
 
         let quote = parse_tencent_quote_line(line, now).expect("quote");
@@ -621,7 +644,7 @@ mod tests {
 
     #[test]
     fn parses_sina_quote_line() {
-        let now = Local.with_ymd_and_hms(2026, 4, 29, 10, 35, 48).unwrap();
+        let now = BEIJING.with_ymd_and_hms(2026, 4, 29, 10, 35, 48).unwrap();
         let line = "var hq_str_sh600519=\"贵州茅台,1498.000,1500.000,1501.000,1510.000,1490.000,1500.500,1501.500,5732446,2832984337.010\";";
 
         let quote = parse_sina_quote_line(line, now).expect("quote");
@@ -641,7 +664,7 @@ mod tests {
 
     #[test]
     fn today_pnl_uses_cost_for_same_day_unavailable_shares() {
-        let now = Local.with_ymd_and_hms(2026, 5, 20, 11, 27, 0).unwrap();
+        let now = BEIJING.with_ymd_and_hms(2026, 5, 20, 11, 27, 0).unwrap();
         let quote = Quote {
             code: "603986".to_owned(),
             name: "兆易创新".to_owned(),
@@ -674,7 +697,7 @@ mod tests {
 
     #[test]
     fn today_pnl_treats_old_available_date_as_overnight() {
-        let now = Local.with_ymd_and_hms(2026, 5, 21, 9, 35, 0).unwrap();
+        let now = BEIJING.with_ymd_and_hms(2026, 5, 21, 9, 35, 0).unwrap();
         let quote = Quote {
             code: "603986".to_owned(),
             name: "兆易创新".to_owned(),
@@ -697,7 +720,7 @@ mod tests {
             quantity: 300.0,
             available_quantity: Some(0.0),
             available_date: Some(
-                Local
+                BEIJING
                     .with_ymd_and_hms(2026, 5, 20, 11, 27, 0)
                     .unwrap()
                     .date_naive(),
@@ -712,7 +735,7 @@ mod tests {
 
     #[test]
     fn today_pnl_uses_intraday_cost_for_same_day_buys() {
-        let now = Local.with_ymd_and_hms(2026, 5, 26, 11, 11, 0).unwrap();
+        let now = BEIJING.with_ymd_and_hms(2026, 5, 26, 11, 11, 0).unwrap();
         let quote = Quote {
             code: "688531".to_owned(),
             name: "日联科技".to_owned(),

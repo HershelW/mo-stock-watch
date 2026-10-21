@@ -1,6 +1,7 @@
 mod ai;
 mod app;
 mod calendar;
+mod clock;
 mod config;
 mod credential;
 mod notification;
@@ -17,6 +18,18 @@ const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app.png");
 
 fn main() -> eframe::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--check-clock") {
+        if let Err(error) = clock::sync() {
+            eprintln!("{error:#}");
+            std::process::exit(2);
+        }
+        println!(
+            "{}\n{}",
+            clock::now().format("%Y-%m-%d %H:%M:%S %:z"),
+            clock::status()
+        );
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--validate-data") {
         match config::load_portfolio() {
             Ok(p) => println!(
@@ -45,13 +58,14 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     if args.iter().any(|arg| arg == "--update-calendar") {
-        match calendar::refresh_from_sse(chrono::Local::now().year()) {
+        match clock::sync().and_then(|_| calendar::refresh_from_sse(clock::now().year())) {
             Ok(count) => println!("updated {count} market holidays"),
             Err(error) => eprintln!("{error:#}"),
         }
         return Ok(());
     }
 
+    clock::start();
     if let Err(error) = config::load_portfolio() {
         rfd::MessageDialog::new()
             .set_title("持仓存档读取失败")

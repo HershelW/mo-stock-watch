@@ -34,6 +34,7 @@ python -m unittest discover -s scripts -p "test_*.py" -v
 ## 模块说明
 
 - `src/main.rs`：创建 eframe 窗口。
+- `src/clock.rs`：HTTPS 网络校时、固定 UTC+8 北京时间与单调计时；`--check-clock` 可单独验证网络时间。
 - `src/app.rs`：应用状态、UI 渲染、用户交互、后台任务轮询。
 - `src/portfolio.rs`：持仓模型、市场推断和数据标准化。
 - `src/quote.rs`：东方财富行情请求、QuoteBook、盈亏计算。

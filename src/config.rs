@@ -1,9 +1,9 @@
 use crate::{
-    credential,
+    clock, credential,
     portfolio::{Holding, Portfolio},
 };
 use anyhow::Context;
-use chrono::Local;
+use chrono::FixedOffset;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -136,7 +136,7 @@ fn write_portfolio(portfolio: &mut Portfolio, create_backup: bool) -> anyhow::Re
         anyhow::bail!("持仓已被其他进程修改，请重新加载后再保存");
     }
     portfolio.normalize();
-    portfolio.last_saved_at = Some(Local::now());
+    portfolio.last_saved_at = Some(clock::now());
     fs::create_dir_all(app_dir()).context("create app data dir")?;
     if create_backup {
         backup_current_portfolio()?;
@@ -214,7 +214,7 @@ fn backup_current_portfolio() -> anyhow::Result<()> {
         return Ok(());
     }
     fs::create_dir_all(backup_dir()).context("create backup dir")?;
-    let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
+    let stamp = clock::now().format("%Y%m%d-%H%M%S-%3f");
     let destination = backup_dir().join(format!("portfolio-{stamp}.json"));
     fs::copy(&source, destination).context("backup portfolio")?;
     trim_backups(20)
@@ -304,7 +304,7 @@ impl Drop for DataLock {
 struct LegacyPortfolio {
     holdings: Vec<Holding>,
     #[serde(default)]
-    last_saved_at: Option<chrono::DateTime<Local>>,
+    last_saved_at: Option<chrono::DateTime<FixedOffset>>,
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
+use crate::clock::{self, BEIJING};
 use anyhow::{bail, Context};
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -103,7 +104,7 @@ pub struct Portfolio {
     #[serde(default)]
     pub snapshots: Vec<DailySnapshot>,
     #[serde(default)]
-    pub last_saved_at: Option<DateTime<Local>>,
+    pub last_saved_at: Option<DateTime<FixedOffset>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +131,7 @@ pub struct Account {
 /// Broker-reported values at one instant, not inferred fills or realized profit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrokerSnapshot {
-    pub observed_at: DateTime<Local>,
+    pub observed_at: DateTime<FixedOffset>,
     pub today_pnl: f64,
     #[serde(default)]
     pub today_pnl_percent: Option<f64>,
@@ -223,8 +224,8 @@ pub struct ExecutionEvidence {
     pub price_basis: String,
     pub fees_known: bool,
     pub date_is_estimated: bool,
-    pub executed_at: Option<DateTime<Local>>,
-    pub observed_at: Option<DateTime<Local>>,
+    pub executed_at: Option<DateTime<FixedOffset>>,
+    pub observed_at: Option<DateTime<FixedOffset>>,
 }
 
 impl Default for ExecutionEvidence {
@@ -298,7 +299,7 @@ pub struct AlertRule {
     #[serde(default)]
     pub was_matching: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_triggered_at: Option<DateTime<Local>>,
+    pub last_triggered_at: Option<DateTime<FixedOffset>>,
     #[serde(default)]
     pub high_watermark: f64,
 }
@@ -374,7 +375,7 @@ impl Account {
 
     pub fn broker_snapshot_for(&self, date: NaiveDate) -> Option<&BrokerSnapshot> {
         self.matching_broker_snapshot()
-            .filter(|s| s.observed_at.date_naive() == date)
+            .filter(|s| s.observed_at.with_timezone(&BEIJING).date_naive() == date)
     }
 
     pub fn owner_label(&self) -> &str {
@@ -526,7 +527,7 @@ impl Portfolio {
 
     pub fn from_legacy_holdings(
         holdings: Vec<Holding>,
-        last_saved_at: Option<DateTime<Local>>,
+        last_saved_at: Option<DateTime<FixedOffset>>,
     ) -> Self {
         let mut portfolio = Self {
             loaded_from: None,
@@ -581,7 +582,7 @@ impl Portfolio {
         for tx in self
             .transactions
             .iter()
-            .filter(|tx| tx.kind == TransactionKind::Sell && tx.date == Local::now().date_naive())
+            .filter(|tx| tx.kind == TransactionKind::Sell && tx.date == clock::now().date_naive())
         {
             if seen.insert(tx.code.clone()) {
                 targets.push(quote_target(&tx.code, &tx.name, tx.market));
@@ -639,7 +640,7 @@ impl Portfolio {
                 {
                     bail!("可用现金不足");
                 }
-                let today = Local::now().date_naive();
+                let today = clock::now().date_naive();
                 let position = account
                     .holdings
                     .iter_mut()
@@ -696,7 +697,7 @@ impl Portfolio {
                 if transaction.quantity > holding.quantity + 0.000_001 {
                     bail!("卖出数量超过当前持仓");
                 }
-                if transaction.date == Local::now().date_naive()
+                if transaction.date == clock::now().date_naive()
                     && transaction.quantity
                         > holding.overnight_quantity_for(transaction.date) + 0.000_001
                 {
@@ -900,7 +901,7 @@ impl Portfolio {
     pub fn next_id(&self, prefix: &str) -> String {
         format!(
             "{prefix}-{}-{}",
-            Local::now().timestamp_millis(),
+            clock::now().timestamp_millis(),
             self.transactions.len() + self.alerts.len()
         )
     }
@@ -1125,6 +1126,41 @@ fn sanitize_account_id(id: &str, idx: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn broker_snapshot_uses_beijing_date_and_preserves_stored_offset() {
+        let mut p = Portfolio::default();
+        let account = &mut p.accounts[0];
+        let observed_at = DateTime::parse_from_rfc3339("2026-10-22T00:30:00+09:00").unwrap();
+        account.broker_snapshot = Some(BrokerSnapshot {
+            observed_at,
+            today_pnl: 1.0,
+            today_pnl_percent: None,
+            total_assets: account.cash,
+            market_value: 0.0,
+            available_cash: account.cash,
+            frozen_cash: None,
+            holdings: Vec::new(),
+        });
+        assert!(account
+            .broker_snapshot_for(NaiveDate::from_ymd_opt(2026, 10, 21).unwrap())
+            .is_some());
+        assert!(account
+            .broker_snapshot_for(NaiveDate::from_ymd_opt(2026, 10, 22).unwrap())
+            .is_none());
+        let raw = serde_json::to_string(&p).unwrap();
+        let restored: Portfolio = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            restored.accounts[0]
+                .broker_snapshot
+                .as_ref()
+                .unwrap()
+                .observed_at
+                .offset()
+                .local_minus_utc(),
+            9 * 3600
+        );
+    }
+
     fn empty_portfolio(cash: f64) -> Portfolio {
         Portfolio {
             loaded_from: None,
@@ -1151,7 +1187,7 @@ mod tests {
         Transaction {
             id: String::new(),
             account_id: "test".to_owned(),
-            date: Local::now().date_naive(),
+            date: clock::now().date_naive(),
             kind,
             code: "600000".to_owned(),
             name: "浦发银行".to_owned(),
@@ -1178,7 +1214,7 @@ mod tests {
     fn frozen_and_unclassified_assets_are_not_income_or_spendable_cash() {
         let mut p = empty_portfolio(100.0);
         let s = BrokerSnapshot {
-            observed_at: Local::now(),
+            observed_at: clock::now(),
             today_pnl: 12.0,
             today_pnl_percent: None,
             total_assets: 1100.0,
@@ -1253,7 +1289,7 @@ mod tests {
         assert!((account.cash - 8_995.0).abs() < 0.001);
         assert!((holding.cost_price - 10.05).abs() < 0.001);
         assert_eq!(holding.available_quantity, Some(0.0));
-        assert_eq!(holding.available_date, Some(Local::now().date_naive()));
+        assert_eq!(holding.available_date, Some(clock::now().date_naive()));
     }
 
     #[test]
@@ -1268,9 +1304,9 @@ mod tests {
         let h = &p.accounts[0].holdings[0];
         assert_eq!(h.quantity, 300.0);
         assert!((h.intraday_cost_price.unwrap() - 3610.0 / 300.0).abs() < 1e-8);
-        assert_eq!(h.overnight_quantity_for(Local::now().date_naive()), 0.0);
+        assert_eq!(h.overnight_quantity_for(clock::now().date_naive()), 0.0);
         assert_eq!(
-            h.overnight_quantity_for(Local::now().date_naive().succ_opt().unwrap()),
+            h.overnight_quantity_for(clock::now().date_naive().succ_opt().unwrap()),
             300.0
         );
         p.accounts[0].holdings[0].available_quantity = Some(400.0);
@@ -1344,7 +1380,7 @@ mod tests {
                 &imported,
                 Some(123.0),
                 false,
-                Local::now().date_naive(),
+                clock::now().date_naive(),
             )
             .unwrap();
         assert_eq!(portfolio.accounts[0].holdings.len(), 2);
@@ -1354,7 +1390,7 @@ mod tests {
                 &imported,
                 Some(456.0),
                 true,
-                Local::now().date_naive(),
+                clock::now().date_naive(),
             )
             .unwrap();
         assert_eq!(portfolio.accounts[0].holdings.len(), 1);

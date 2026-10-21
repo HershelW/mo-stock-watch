@@ -1,6 +1,7 @@
 use crate::{
     ai::{self, RecognizedPortfolio},
     calendar,
+    clock::{self, BEIJING},
     config::{self, AppSettings},
     notification, ocr,
     portfolio::{
@@ -10,7 +11,7 @@ use crate::{
     quote::{self, QuoteBook, QuoteFetchResult},
     updater::{self, UpdateInfo},
 };
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{
     self, vec2, Align, Color32, FontData, FontFamily, FontId, Frame, Grid, Key, Layout, Rect,
     RichText, ScrollArea, Sense, Stroke, TextStyle, ViewportCommand,
@@ -213,10 +214,11 @@ struct DailyPnlView {
 impl DailyPnlView {
     fn tooltip(&self) -> String {
         format!(
-            "{} · {}\n{}",
+            "{} · {}\n{}\n{}",
             self.label,
             self.caption,
-            self.details.join("\n")
+            self.details.join("\n"),
+            clock::status()
         )
     }
 }
@@ -263,7 +265,9 @@ impl Default for TransactionDraft {
         Self {
             account_index: 0,
             kind: TransactionKind::Buy,
-            date: Local::now().format("%Y-%m-%d").to_string(),
+            date: clock::network_now()
+                .map(|t| t.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
             code: String::new(),
             name: String::new(),
             quantity: 100.0,
@@ -319,6 +323,7 @@ pub struct StockWatchApp {
     last_snapshot_save_at: Option<Instant>,
     pending_attention: bool,
     selected_owner: String,
+    clock_ready: bool,
 }
 
 impl StockWatchApp {
@@ -328,7 +333,7 @@ impl StockWatchApp {
         portfolio.normalize();
         let settings = config::load_settings();
         let cached_quotes = quote::load_cache();
-        let mut app = Self {
+        let app = Self {
             portfolio,
             settings,
             quotes: cached_quotes,
@@ -353,6 +358,7 @@ impl StockWatchApp {
             last_snapshot_save_at: None,
             pending_attention: false,
             selected_owner: DEFAULT_OWNER.to_owned(),
+            clock_ready: false,
         };
         if app.settings.ultra_compact {
             cc.egui_ctx
@@ -361,7 +367,6 @@ impl StockWatchApp {
                     COMPACT_WINDOW_SIZE[1],
                 )));
         }
-        app.start_fetch(true);
         Ok(app)
     }
 
@@ -369,7 +374,12 @@ impl StockWatchApp {
         if self.fetch_rx.is_some() {
             return;
         }
-        let off_session_delay = delay_until_next_market_session(Local::now());
+        if !clock::is_synced() {
+            self.next_refresh_at = Instant::now() + Duration::from_secs(1);
+            self.status = "等待北京时间网络校准...".into();
+            return;
+        }
+        let off_session_delay = delay_until_next_market_session(clock::now());
         if !force_once {
             if let Some(delay) = off_session_delay {
                 self.quotes.loading = false;
@@ -400,7 +410,7 @@ impl StockWatchApp {
                     .iter()
                     .map(|quote| quote.updated_at)
                     .min()
-                    .unwrap_or_else(Local::now);
+                    .unwrap_or_else(clock::now);
                 self.quotes.quotes = result
                     .quotes
                     .into_iter()
@@ -414,7 +424,7 @@ impl StockWatchApp {
                 let _ = quote::save_cache(&self.quotes.quotes);
                 self.evaluate_alerts();
                 self.record_snapshot_if_due();
-                if let Some(delay) = delay_until_next_market_session(Local::now()) {
+                if let Some(delay) = delay_until_next_market_session(clock::now()) {
                     self.next_refresh_at = Instant::now() + delay;
                     self.status = format!(
                         "行情已更新（{}，非交易时段）；{} 后刷新",
@@ -431,7 +441,7 @@ impl StockWatchApp {
                 self.quotes.loading = false;
                 self.fetch_rx = None;
                 self.quote_failure_count = self.quote_failure_count.saturating_add(1);
-                let delay = delay_until_next_market_session(Local::now())
+                let delay = delay_until_next_market_session(clock::now())
                     .unwrap_or_else(|| self.failure_refresh_delay());
                 self.next_refresh_at = Instant::now() + delay;
                 self.status = format!(
@@ -582,7 +592,7 @@ impl StockWatchApp {
             Ok(holdings) => {
                 self.pending_import = Some(RecognizedPortfolio {
                     holdings,
-                    as_of_date: Some(Local::now().date_naive()),
+                    as_of_date: clock::network_now().map(|t| t.date_naive()),
                     ..Default::default()
                 });
                 self.import_account_index = 0;
@@ -669,6 +679,10 @@ impl StockWatchApp {
     }
 
     fn apply_pending_import(&mut self) {
+        if !clock::is_synced() {
+            self.status = "请等待北京时间校准后再应用持仓".into();
+            return;
+        }
         let Some(result) = self.pending_import.clone() else {
             return;
         };
@@ -679,7 +693,7 @@ impl StockWatchApp {
         let account_id = account.id.clone();
         let date = result
             .as_of_date
-            .unwrap_or_else(|| Local::now().date_naive());
+            .unwrap_or_else(|| clock::now().date_naive());
         let cash = result.cash.or_else(|| {
             result
                 .total_assets
@@ -709,6 +723,10 @@ impl StockWatchApp {
     }
 
     fn submit_transaction(&mut self) {
+        if !clock::is_synced() {
+            self.status = "请等待北京时间校准后再记录交易".into();
+            return;
+        }
         let Some(account) = self
             .portfolio
             .accounts
@@ -811,7 +829,7 @@ impl StockWatchApp {
                     quote.price,
                     quote.change_percent
                 ));
-                alert.last_triggered_at = Some(Local::now());
+                alert.last_triggered_at = Some(clock::now());
                 self.pending_attention = true;
             }
             if alert.was_matching != matching {
@@ -829,6 +847,9 @@ impl StockWatchApp {
     }
 
     fn record_snapshot_if_due(&mut self) {
+        if !clock::is_synced() {
+            return;
+        }
         if self
             .last_snapshot_save_at
             .is_some_and(|last| last.elapsed() < Duration::from_secs(300))
@@ -838,8 +859,8 @@ impl StockWatchApp {
         let totals = self.totals_for_owner(DEFAULT_OWNER);
         if self.portfolio.holdings().any(|h| {
             self.quotes.quotes.get(&h.code).is_none_or(|q| {
-                q.updated_at.date_naive() != Local::now().date_naive()
-                    || (Local::now() - q.updated_at).num_seconds() > 120
+                q.updated_at.with_timezone(&BEIJING).date_naive() != clock::now().date_naive()
+                    || (clock::now() - q.updated_at).num_seconds() > 120
             })
         }) {
             return;
@@ -854,8 +875,8 @@ impl StockWatchApp {
         let date = self
             .quotes
             .last_updated_at
-            .map(|value| value.date_naive())
-            .unwrap_or_else(|| Local::now().date_naive());
+            .map(|value| value.with_timezone(&BEIJING).date_naive())
+            .unwrap_or_else(|| clock::now().date_naive());
         let benchmark = self.quotes.quotes.get("000300");
         self.portfolio.upsert_snapshot(DailySnapshot {
             date,
@@ -894,7 +915,7 @@ impl StockWatchApp {
                 }
             });
         let cash = self.cash_for_owner(owner);
-        let day = Local::now().date_naive();
+        let day = clock::now().date_naive();
         let today_pnl = accounts.iter().try_fold(0.0, |sum, a| {
             account_daily_estimate(a, &self.portfolio.transactions, &self.quotes.quotes, day)
                 .map(|value| sum + value)
@@ -914,6 +935,15 @@ impl StockWatchApp {
     }
 
     fn daily_pnl_view(&self) -> DailyPnlView {
+        let Some(now) = clock::network_now() else {
+            return DailyPnlView {
+                value: f64::NAN,
+                percent: None,
+                label: "今日盈亏",
+                caption: "等待北京时间网络校准".into(),
+                details: Vec::new(),
+            };
+        };
         let accounts = self
             .portfolio
             .accounts
@@ -924,7 +954,7 @@ impl StockWatchApp {
             &accounts,
             &self.portfolio.transactions,
             &self.quotes.quotes,
-            Local::now().date_naive(),
+            now.date_naive(),
         )
     }
 
@@ -994,6 +1024,13 @@ impl StockWatchApp {
 
 impl eframe::App for StockWatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.clock_ready && clock::is_synced() {
+            self.clock_ready = true;
+            if self.transaction_draft.date.is_empty() {
+                self.transaction_draft.date = clock::now().format("%Y-%m-%d").to_string();
+            }
+            self.start_fetch(true);
+        }
         self.poll_fetch();
         self.poll_ai_ocr();
         self.poll_update_check();
@@ -1102,14 +1139,19 @@ impl StockWatchApp {
             .inner_margin(10.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let time = Local::now().format("%H:%M:%S").to_string();
+                    let time = clock::network_now()
+                        .map(|t| t.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| "待校时".into());
                     ui.label(
-                        RichText::new(format!("A股 · {time}"))
+                        RichText::new(format!("北京 · {time}"))
                             .color(palette.text_secondary)
                             .strong(),
-                    );
-                    if let Some(updated_at) = self.quotes.last_updated_at {
-                        let age = (Local::now() - updated_at).num_seconds().max(0);
+                    )
+                    .on_hover_text(clock::status());
+                    if let Some(updated_at) =
+                        self.quotes.last_updated_at.filter(|_| clock::is_synced())
+                    {
+                        let age = (clock::now() - updated_at).num_seconds().max(0);
                         let stale = age > 120;
                         ui.label(
                             RichText::new(if stale {
@@ -1621,7 +1663,7 @@ impl StockWatchApp {
                 ui.separator();
                 ui.label(format!("交易日历：{}", calendar::source_label()));
                 if ui.button("从上交所更新").clicked() {
-                    match calendar::refresh_from_sse(Local::now().year()) {
+                    match calendar::refresh_from_sse(clock::now().year()) {
                         Ok(count) => self.status = format!("交易日历已更新，共 {count} 个休市日"),
                         Err(err) => self.status = format!("交易日历更新失败：{err:#}"),
                     }
@@ -1659,7 +1701,11 @@ impl StockWatchApp {
                             ui.label(
                                 alert
                                     .last_triggered_at
-                                    .map(|time| time.format("%m-%d %H:%M").to_string())
+                                    .map(|time| {
+                                        time.with_timezone(&BEIJING)
+                                            .format("%m-%d %H:%M")
+                                            .to_string()
+                                    })
                                     .unwrap_or_else(|| "--".to_owned()),
                             );
                             if ui.button("删除").clicked() {
@@ -2003,7 +2049,10 @@ impl StockWatchApp {
                 ui.label(
                     RichText::new(format!(
                         "更新 {}",
-                        quote.updated_at.format("%Y-%m-%d %H:%M:%S")
+                        quote
+                            .updated_at
+                            .with_timezone(&BEIJING)
+                            .format("%Y-%m-%d %H:%M:%S")
                     ))
                     .small()
                     .color(palette.text_muted),
@@ -2926,7 +2975,7 @@ fn account_daily_estimate(
     for h in &account.holdings {
         let q = quotes
             .get(&h.code)
-            .filter(|q| q.updated_at.date_naive() == day)?;
+            .filter(|q| q.updated_at.with_timezone(&BEIJING).date_naive() == day)?;
         value += q.today_pnl(h);
     }
     for tx in transactions.iter().filter(|t| {
@@ -2940,7 +2989,7 @@ fn account_daily_estimate(
         value += tx.daily_pnl(
             quotes
                 .get(&tx.code)
-                .filter(|q| q.updated_at.date_naive() == day)
+                .filter(|q| q.updated_at.with_timezone(&BEIJING).date_naive() == day)
                 .map(|q| q.previous_close),
         )?;
     }
@@ -2956,6 +3005,7 @@ fn daily_pnl_view(
     let mut value = 0.0;
     let mut details = Vec::new();
     let mut broker_count = 0;
+    let mut live_count = 0;
     let mut percent = None;
     let mut reference_assets = 0.0;
     let mut times = BTreeSet::new();
@@ -2965,18 +3015,51 @@ fn daily_pnl_view(
         let name = format!("{} {}", account.name, account.account_suffix);
         if let Some(s) = account.broker_snapshot_for(day) {
             broker_count += 1;
-            times.insert(s.observed_at.format("%H:%M").to_string());
-            value += s.today_pnl;
-            reference_assets += s.total_assets;
-            if accounts.len() == 1 {
-                percent = s.today_pnl_percent;
+            times.insert(
+                s.observed_at
+                    .with_timezone(&BEIJING)
+                    .format("%H:%M")
+                    .to_string(),
+            );
+            let delta = account
+                .holdings
+                .iter()
+                .try_fold(0.0, |sum, h| {
+                    quotes
+                        .get(&h.code)
+                        .filter(|q| {
+                            q.updated_at.with_timezone(&BEIJING).date_naive() == day
+                                && q.updated_at >= s.observed_at
+                                && q.price.is_finite()
+                                && q.price > 0.0
+                        })
+                        .map(|q| sum + q.market_value(h))
+                })
+                .map(|market| market - s.market_value)
+                .filter(|delta| delta.is_finite());
+            value += s.today_pnl + delta.unwrap_or(0.0);
+            reference_assets += s.total_assets + delta.unwrap_or(0.0);
+            if let Some(delta) = delta {
+                live_count += 1;
+                details.push(format!(
+                    "{name}：券商基准 {:+.2}（{} 截图）＋持仓市值变化 {:+.2} = 今日实时参考 {:+.2}；独立估算 {}",
+                    s.today_pnl,
+                    s.observed_at.with_timezone(&BEIJING).format("%H:%M"),
+                    delta,
+                    s.today_pnl + delta,
+                    format_money(estimate)
+                ));
+            } else {
+                if accounts.len() == 1 {
+                    percent = s.today_pnl_percent;
+                }
+                details.push(format!(
+                    "{name}：暂列券商截图 {:+.2}（{}）；最新行情不齐或早于截图，等待行情；实时估算 {}",
+                    s.today_pnl,
+                    s.observed_at.with_timezone(&BEIJING).format("%H:%M"),
+                    format_money(estimate)
+                ));
             }
-            details.push(format!(
-                "{name}：券商今日 {:+.2}（{} 截图）；实时估算 {}",
-                s.today_pnl,
-                s.observed_at.format("%H:%M"),
-                format_money(estimate)
-            ));
         } else {
             value += estimate;
             reference_assets += account.cash
@@ -2990,7 +3073,7 @@ fn daily_pnl_view(
                     .try_fold(0.0, |sum, h| {
                         quotes
                             .get(&h.code)
-                            .filter(|q| q.updated_at.date_naive() == day)
+                            .filter(|q| q.updated_at.with_timezone(&BEIJING).date_naive() == day)
                             .map(|q| sum + q.market_value(h))
                     })
                     .unwrap_or(f64::NAN);
@@ -3000,7 +3083,7 @@ fn daily_pnl_view(
                 .map(|s| {
                     format!(
                         "；{}快照已过期或持仓已变",
-                        s.observed_at.format("%m-%d %H:%M")
+                        s.observed_at.with_timezone(&BEIJING).format("%m-%d %H:%M")
                     )
                 })
                 .unwrap_or_default();
@@ -3019,13 +3102,15 @@ fn daily_pnl_view(
                     .map(|n| format!("{n:.2}"))
                     .unwrap_or_else(|| "待核".into()),
                 s.unclassified_assets(),
-                s.observed_at.format("%m-%d %H:%M")
+                s.observed_at.with_timezone(&BEIJING).format("%m-%d %H:%M")
             ));
         }
     }
     let label = if broker_count == 0 {
         "今日估算"
-    } else if broker_count == accounts.len() {
+    } else if live_count == accounts.len() {
+        "今日参考·实时"
+    } else if broker_count == accounts.len() && live_count == 0 {
         "券商今日·截图"
     } else {
         "今日参考·混合"
@@ -3034,10 +3119,15 @@ fn daily_pnl_view(
         "实时估算；行情或成交不足时待核".into()
     } else {
         format!(
-            "{}截图 · {}/{}账户；不随行情刷新",
+            "{}截图基准 · {}/{}账户；随最新持仓行情重算{}",
             times.into_iter().collect::<Vec<_>>().join("/"),
             broker_count,
-            accounts.len()
+            accounts.len(),
+            if live_count < broker_count {
+                "；部分截图暂待行情"
+            } else {
+                ""
+            }
         )
     };
     if percent.is_none() {
@@ -3075,7 +3165,7 @@ fn owner_options_for(accounts: &[Account]) -> Vec<String> {
 }
 
 fn monthly_portfolio_return(portfolio: &Portfolio) -> Option<f64> {
-    let today = Local::now().date_naive();
+    let today = clock::now().date_naive();
     let month = portfolio
         .snapshots
         .iter()
@@ -3113,7 +3203,7 @@ fn monthly_portfolio_return(portfolio: &Portfolio) -> Option<f64> {
 }
 
 fn monthly_benchmark_return(snapshots: &[DailySnapshot]) -> Option<f64> {
-    let today = Local::now().date_naive();
+    let today = clock::now().date_naive();
     let month = snapshots
         .iter()
         .filter(|snapshot| {
@@ -3149,7 +3239,8 @@ fn format_percent(value: f64) -> String {
     format!("{value:+.2}%")
 }
 
-fn delay_until_next_market_session(now: chrono::DateTime<Local>) -> Option<Duration> {
+fn delay_until_next_market_session(now: chrono::DateTime<FixedOffset>) -> Option<Duration> {
+    let now = now.with_timezone(&BEIJING);
     if is_market_session_time(now.naive_local()) {
         return None;
     }
@@ -3229,6 +3320,19 @@ fn format_duration_for_status(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn tokyo_timestamps_use_beijing_market_hours() {
+        let tokyo = FixedOffset::east_opt(9 * 3600).unwrap();
+        let opening = tokyo.with_ymd_and_hms(2026, 10, 21, 10, 30, 0).unwrap();
+        assert!(delay_until_next_market_session(opening).is_none());
+        let lunch = tokyo.with_ymd_and_hms(2026, 10, 21, 13, 0, 0).unwrap();
+        assert_eq!(
+            delay_until_next_market_session(lunch),
+            Some(Duration::from_secs(3600))
+        );
+    }
     use chrono::NaiveDate;
 
     fn dt(date: &str, hour: u32, minute: u32) -> NaiveDateTime {
@@ -3258,7 +3362,7 @@ mod tests {
 
     #[test]
     fn broker_pnl_is_timestamped_and_mixed_coverage_is_explicit() {
-        let day = Local::now().date_naive();
+        let day = clock::now().date_naive();
         let mut p = Portfolio::default();
         let mut second = p.accounts[0].clone();
         second.id = "broker".into();
@@ -3266,7 +3370,7 @@ mod tests {
         second.account_suffix = "1234".into();
         second.cash = 100.0;
         second.broker_snapshot = Some(crate::portfolio::BrokerSnapshot {
-            observed_at: Local::now(),
+            observed_at: clock::now(),
             today_pnl: 80.0,
             today_pnl_percent: Some(2.0),
             total_assets: 150.0,
@@ -3287,9 +3391,9 @@ mod tests {
         assert!(account_daily_estimate(&p.accounts[1], &p.transactions, &quotes, day).is_none());
         let broker = daily_pnl_view(&[&p.accounts[1]], &p.transactions, &quotes, day);
         assert_eq!(broker.value, 80.0);
-        assert_eq!(broker.percent, Some(2.0));
-        assert_eq!(broker.label, "券商今日·截图");
-        assert!(broker.details[0].contains("实时估算 待核"));
+        assert!((broker.percent.unwrap() - 80.0 / 70.0 * 100.0).abs() < 1e-6);
+        assert_eq!(broker.label, "今日参考·实时");
+        assert!(broker.details[0].contains("独立估算 待核"));
         assert!(broker.details[1].contains("其他资产/待核差额 50.00"));
         let mixed = daily_pnl_view(
             &p.accounts.iter().collect::<Vec<_>>(),
@@ -3314,6 +3418,124 @@ mod tests {
         );
     }
 
+    fn broker_daily_fixture() -> (Account, HashMap<String, quote::Quote>, NaiveDate) {
+        let observed = BEIJING.with_ymd_and_hms(2026, 10, 21, 10, 0, 0).unwrap();
+        let holdings = serde_json::json!([{
+            "code":"600000", "name":"Fixture", "market":"Shanghai",
+            "quantity":100.0, "cost_price":10.0
+        }]);
+        let account = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "name":"Fixture", "cash":1000.0, "holdings":holdings,
+            "broker_snapshot":{"observed_at":observed, "today_pnl":80.0,
+                "today_pnl_percent":3.77, "total_assets":2200.0,
+                "market_value":1200.0, "available_cash":1000.0, "holdings":holdings}
+        }))
+        .unwrap();
+        let quote: quote::Quote = serde_json::from_value(serde_json::json!({
+            "code":"600000", "name":"Fixture", "price":13.0, "previous_close":11.0,
+            "change_percent":18.18, "updated_at":observed + chrono::Duration::minutes(1)
+        }))
+        .unwrap();
+        (
+            account,
+            HashMap::from([(quote.code.clone(), quote)]),
+            observed.date_naive(),
+        )
+    }
+
+    #[test]
+    fn broker_daily_pnl_and_percent_follow_market_delta_without_mutating_baseline() {
+        let (account, mut quotes, day) = broker_daily_fixture();
+        let original = serde_json::to_value(&account).unwrap();
+        let rising = daily_pnl_view(&[&account], &[], &quotes, day);
+        assert_eq!(rising.value, 180.0); // Preserves the broker's realized/fee baseline.
+        assert!((rising.percent.unwrap() - 180.0 / 2120.0 * 100.0).abs() < 1e-6);
+        assert_eq!(rising.label, "今日参考·实时");
+        assert_eq!(
+            account_daily_estimate(&account, &[], &quotes, day),
+            Some(200.0)
+        );
+
+        quotes.get_mut("600000").unwrap().price = 11.0;
+        let falling = daily_pnl_view(&[&account], &[], &quotes, day);
+        assert_eq!(falling.value, -20.0);
+        assert!((falling.percent.unwrap() - -20.0 / 2120.0 * 100.0).abs() < 1e-6);
+        assert_eq!(serde_json::to_value(&account).unwrap(), original);
+
+        let other = account.clone();
+        let combined = daily_pnl_view(&[&account, &other], &[], &quotes, day);
+        assert_eq!(combined.value, -40.0);
+        assert!((combined.percent.unwrap() - -40.0 / 4240.0 * 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn broker_daily_pnl_marks_missing_older_or_invalid_quotes_as_waiting() {
+        let (mut account, mut quotes, day) = broker_daily_fixture();
+        let observed = account.broker_snapshot.as_ref().unwrap().observed_at;
+        for updated_at in [
+            observed - chrono::Duration::seconds(1),
+            observed - chrono::Duration::days(1),
+        ] {
+            quotes.get_mut("600000").unwrap().updated_at = updated_at;
+            let view = daily_pnl_view(&[&account], &[], &quotes, day);
+            assert_eq!(view.value, 80.0);
+            assert_eq!(view.percent, Some(3.77));
+            assert_eq!(view.label, "券商今日·截图");
+            assert!(view.details[0].contains("等待行情"));
+        }
+        quotes.get_mut("600000").unwrap().updated_at = observed;
+        for price in [f64::NAN, f64::INFINITY, 0.0] {
+            quotes.get_mut("600000").unwrap().price = price;
+            assert_eq!(daily_pnl_view(&[&account], &[], &quotes, day).value, 80.0);
+        }
+        quotes.get_mut("600000").unwrap().price = 13.0;
+        let mut missing = account.holdings[0].clone();
+        missing.code = "600001".into();
+        account.holdings.push(missing.clone());
+        let snapshot = account.broker_snapshot.as_mut().unwrap();
+        snapshot.holdings.push(missing);
+        snapshot.market_value += 1200.0;
+        snapshot.total_assets += 1200.0;
+        let partial = daily_pnl_view(&[&account], &[], &quotes, day);
+        assert_eq!(partial.value, 80.0);
+        assert!(partial.caption.contains("暂待行情"));
+    }
+
+    #[test]
+    fn holdings_update_recalculates_pnl_and_replaces_the_old_broker_baseline() {
+        let (account, mut quotes, day) = broker_daily_fixture();
+        let mut portfolio = Portfolio::default();
+        portfolio.accounts = vec![account];
+        let mut updated = portfolio.accounts[0].holdings[0].clone();
+        updated.quantity = 200.0;
+        updated.cost_price = 11.0;
+        portfolio
+            .reconcile_account("fixture", &[updated], Some(2000.0), true, day)
+            .unwrap();
+        let account = &mut portfolio.accounts[0];
+        assert!(account.broker_snapshot_for(day).is_none());
+        let view = daily_pnl_view(&[account], &portfolio.transactions, &quotes, day);
+        assert_eq!(view.value, 400.0);
+        assert_eq!(view.label, "今日估算");
+        let quote = quotes.get("600000").unwrap();
+        assert_eq!(quote.market_value(&account.holdings[0]), 2600.0);
+        assert_eq!(quote.position_pnl(&account.holdings[0]), 400.0);
+
+        let observed = quote.updated_at;
+        account.broker_snapshot = Some(crate::portfolio::BrokerSnapshot {
+            observed_at: observed,
+            today_pnl: 30.0,
+            today_pnl_percent: None,
+            total_assets: 4600.0,
+            market_value: 2600.0,
+            available_cash: account.cash,
+            frozen_cash: None,
+            holdings: account.holdings.clone(),
+        });
+        quotes.get_mut("600000").unwrap().price = 13.5;
+        assert_eq!(daily_pnl_view(&[account], &[], &quotes, day).value, 130.0);
+    }
+
     #[test]
     fn monthly_returns_use_same_owner_flows_and_endpoint_levels() {
         let mut p = Portfolio::default();
@@ -3321,7 +3543,7 @@ mod tests {
         other.id = "other".into();
         other.owner = "B".into();
         p.accounts.push(other);
-        let start = Local::now().date_naive().with_day(1).unwrap();
+        let start = clock::now().date_naive().with_day(1).unwrap();
         let end = start.with_day(3).unwrap();
         for (date, assets, level) in [(start, 100.0, 100.0), (end, 120.0, 110.0)] {
             p.snapshots.push(DailySnapshot {
@@ -3392,7 +3614,7 @@ mod tests {
 
     #[test]
     fn aggregate_daily_percentage_uses_source_capital_not_average_percent() {
-        let now = Local::now();
+        let now = clock::now();
         let make_account = |id: &str, assets: f64, reported_percent: f64| -> Account {
             serde_json::from_value(serde_json::json!({
                 "id":id, "name":"Fixture", "cash":assets, "holdings":[],
